@@ -4,6 +4,28 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.1 — 12 Oct 2026
+
+Preview fixes from the pilot server's own diagnostics, by Demi.
+
+**The camera wall costs far less when monitoring is stopped.** Every tile
+was being encoded at the camera's full resolution, up to 2592 x 1944, eight
+times a second, to keep the zone editor's snapshot sharp. On the pilot
+server that kept the preview process busy with nothing running. Tiles are
+now encoded at 960 pixels wide; the zone editor still gets a full-resolution
+snapshot when it asks for one.
+
+**A stopped preview is never reused.** Closing a tile while its camera was
+not answering could leave a half-stopped capture behind, and the next time
+the tile opened it got that one instead of a fresh connection. Those tiles
+sat on "waiting for the first image" indefinitely. The capture is now
+replaced.
+
+**Support bundles say what each preview is doing.** Running, stopping,
+waiting for an image, or never started, and whether its reader thread is
+still alive, so a camera that never answers is told apart from a stuck
+preview.
+
 ## v1.10.0 — 10 Oct 2026
 
 **Choose where alerts are checked.** Until now the AI that double-checks
