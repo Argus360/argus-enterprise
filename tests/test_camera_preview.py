@@ -43,8 +43,7 @@ def test_snapshot_reuses_capture_and_dimensions(preview):
     with patch("cvti.app.preview.LiveWall") as factory:
         wall = factory.return_value.start.return_value
         wall._threads = []
-        wall.jpeg.return_value = b"jpg"
-        wall.frames.return_value = {"cam": {"w": 1920, "h": 1080}}
+        wall.snapshot.return_value = {"uri": "data:image/jpeg;base64,anBn", "w": 1920, "h": 1080}
         preview.acquire("cam")
         snapshot = preview.snapshot("cam")
         assert (snapshot["w"], snapshot["h"]) == (1920, 1080)
@@ -73,6 +72,50 @@ def test_disconnected_capture_does_not_serve_old_jpeg():
     assert wall.jpeg("cam") == b"old"
     wall._set("cam", ok=False)
     assert wall.jpeg("cam") is None
+
+
+def test_stopping_capture_is_not_reused_and_replaced_after_exit(preview):
+    preview.descriptor("cam", 0)
+    with patch("cvti.app.preview.LiveWall") as factory:
+        old, new = MagicMock(), MagicMock()
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        old._threads = [thread]
+        new._threads = []
+        factory.return_value.start.side_effect = [old, new]
+        assert preview.acquire("cam")
+        preview.release("cam")
+        assert not preview.acquire("cam")
+        assert preview.jpeg("cam") is None
+        assert factory.call_count == 1
+        thread.is_alive.return_value = False
+        assert preview.acquire("cam")
+        assert factory.call_count == 2
+        assert preview._walls["cam"] is new
+        preview.release("cam")
+
+
+def test_preview_scales_jpeg_but_snapshot_keeps_source_resolution():
+    import cv2
+    import numpy as np
+    import base64
+    from cvti.app.live_wall import LiveWall
+    wall = LiveWall([], width=960, retain_snapshot=True)
+    cap = MagicMock()
+
+    def read():
+        wall._stop.set()
+        return True, np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    cap.read.side_effect = read
+    with patch.object(wall, "_open", return_value=cap):
+        wall._decode("cam", "rtsp://test/live")
+    preview_frame = cv2.imdecode(np.frombuffer(wall.jpeg("cam"), dtype=np.uint8), 1)
+    assert preview_frame.shape[:2] == (540, 960)
+    snapshot = wall.snapshot("cam")
+    assert (snapshot["w"], snapshot["h"]) == (1920, 1080)
+    image = cv2.imdecode(np.frombuffer(base64.b64decode(snapshot["uri"].split(",")[1]), dtype=np.uint8), 1)
+    assert image.shape[:2] == (1080, 1920)
 
 
 @pytest.mark.parametrize("source", [0, "0", "clip.mp4", "rtsp://camera/live"])
