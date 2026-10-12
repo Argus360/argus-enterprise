@@ -64,3 +64,29 @@ pilot retest. Fullscreen live previews share the 960-pixel limit.
 
 Validation: 53 focused capture, preview, recovery, snapshot and support tests
 passed locally. Windows build and client camera validation remain separate.
+
+## Startup and Connection Follow-up
+
+The v1.10.1 export recorded camera opens taking 6-12 seconds while the MJPEG
+server allowed only five seconds without an image. First-image startup now
+allows 30 seconds server-side and 35 seconds in the renderer; established
+streams retain the five-second stall deadline. Unavailable cameras can therefore
+take longer to display a failure, but healthy slow opens are not stopped early.
+
+Each camera descriptor now has a stable, separately authenticated localhost port
+for its long-lived MJPEG request. This removes cross-camera sharing of one
+HTTP/1.1 origin's connection pool. It is a mitigation for request queuing, not
+proof that queuing caused every absent camera in the pilot. Captures remain lazy
+and viewer-owned. Servers close when the preview manager closes.
+
+Exports include `stream_request_count` (requests reaching acquire, including
+requests refused while a capture is stopping). A zero count distinguishes a
+descriptor request from a capture request that actually reached the server.
+`stage_wall_times` contains bounded count, total, mean and maximum durations for
+read, resize and JPEG encoding. Read includes waiting for source data; these
+are elapsed durations, not CPU utilisation or end-to-end video latency.
+
+More cameras may now connect concurrently, which can increase total decoder
+load. No CPU reduction or HEVC corruption fix is claimed by this change.
+Validation includes 55 focused Python tests, eight browser tests and production
+frontend/Electron compilation. Pilot validation is still required.

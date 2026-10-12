@@ -35,6 +35,16 @@ class LiveWall:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._diagnostics = {}
+        self._timings = {}
+
+    def _timed(self, cam_id, stage, started):
+        elapsed = (time.perf_counter() - started) * 1000
+        with self._lock:
+            rec = self._timings.setdefault(cam_id, {}).setdefault(stage,
+                {"count": 0, "total_ms": 0.0, "max_ms": 0.0})
+            rec["count"] += 1
+            rec["total_ms"] += elapsed
+            rec["max_ms"] = max(rec["max_ms"], elapsed)
 
     def _record(self, cam_id, state=None, **values):
         with self._lock:
@@ -50,8 +60,12 @@ class LiveWall:
         from copy import deepcopy
         with self._lock:
             records = deepcopy(self._diagnostics)
+            timings = deepcopy(self._timings)
         now = time.time()
-        for rec in records.values():
+        for cam_id, rec in records.items():
+            rec["stage_wall_times"] = {stage: dict(values,
+                mean_ms=round(values["total_ms"] / values["count"], 2))
+                for stage, values in timings.get(cam_id, {}).items()}
             last = rec.get("last_decoded_at")
             rec["last_decoded_age_s"] = round(now - last, 2) if last else None
             rec["average_published_fps"] = round(rec["published_count"] / max(.001, now - rec["started_at"]), 2)
@@ -104,7 +118,9 @@ class LiveWall:
         n = 0
         dead_since = 0.0
         while not self._stop.is_set():
+            started = time.perf_counter()
             ok, frame = cap.read()
+            self._timed(cam_id, "read", started)
             if not ok:
                 if is_file:                       # loop the clip so it plays continuously
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -159,8 +175,12 @@ class LiveWall:
             if self.retain_snapshot:
                 with self._lock:
                     self._raw[cam_id] = frame.copy()
+            started = time.perf_counter()
             frame = self._downscale(frame)
+            self._timed(cam_id, "resize", started)
+            started = time.perf_counter()
             ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+            self._timed(cam_id, "jpeg_encode", started)
             if ok2:
                 with self._lock:
                     self._diagnostics[cam_id]["published_count"] += 1
@@ -231,6 +251,10 @@ class FrameServer:
         self._httpd = None
         self._thread = None
         self._stopped = threading.Event()
+
+    @staticmethod
+    def expired(elapsed, received_image):
+        return elapsed > (5 if received_image else 30)
 
     def start(self) -> int:
         import threading
@@ -314,7 +338,7 @@ class FrameServer:
                                              + f"Content-Length: {len(jpg)}\r\n\r\n".encode()
                                              + jpg + b"\r\n")
                             self.wfile.flush()
-                        if _t.monotonic() - last_frame > 5:
+                        if FrameServer.expired(_t.monotonic() - last_frame, last is not None):
                             break  # no stale frame masquerading as live video
                         _t.sleep(0.12)
                 except (BrokenPipeError, ConnectionResetError, TimeoutError):

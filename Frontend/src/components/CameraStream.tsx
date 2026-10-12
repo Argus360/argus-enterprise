@@ -11,7 +11,7 @@ import { resolveCameraStream, type ResolvedCameraStream } from "../lib/whep";
 import { Empty, Spinner } from "./common";
 
 const RETRY_OFFLINE_MS = 5_000;
-const FIRST_FRAME_TIMEOUT_MS = 20_000;
+const FIRST_FRAME_TIMEOUT_MS = 35_000;
 
 type PlayerState =
   | { kind: "loading" }

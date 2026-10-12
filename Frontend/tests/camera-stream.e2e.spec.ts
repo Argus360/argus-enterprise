@@ -25,6 +25,8 @@ test("a stream with no first image times out and retries without a remount", asy
   await render(page, { state: "connected", descriptor: { kind: "mjpeg", url: "/stalled.mjpeg" } });
   await expect(page.locator(".media-label")).toHaveText("CONNECTING");
   await page.clock.runFor(20_100);
+  await expect(page.locator(".media-label")).toHaveText("CONNECTING");
+  await page.clock.runFor(15_000);
   await expect(page.locator(".media-label")).toHaveText("OFFLINE");
   await expect(page.getByText("No camera image received. Retrying the connection.")).toBeVisible();
   await render(page, { state: "connected", descriptor: { kind: "mjpeg", url: "/recovered.mjpeg" } });
