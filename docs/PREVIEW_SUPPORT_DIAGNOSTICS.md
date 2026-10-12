@@ -39,3 +39,28 @@ presenting it as a new monitoring failure.
 Local validation: 33 focused Python tests, 248 frontend tests, frontend and
 Electron production compilation. Windows packaging and live-camera validation
 are separate gates; these changes do not establish an HEVC corruption fix.
+
+## Capture Recovery Follow-up
+
+The v1.10.0 preview-only export showed Engineering Corridor 1 and Evap
+Production with zero decoded images and no current viewers. Code inspection
+found that a capture stopped during a blocked read could remain in the manager
+and be reused after its reader exited. Reacquisition now refuses stopping
+captures until their readers exit, then replaces them. It never opens a second
+reader over a still-blocked one. A native read that never exits still needs
+further investigation; this is not a hard native-decoder timeout fix.
+
+Capture shutdown no longer waits while holding the preview manager lock, so
+one reader's join timeout does not block frame access for all other cameras.
+Exports distinguish stopping captures and reader liveness, and include cameras
+with requested descriptors but no capture session as `not_started`.
+
+Overview JPEGs are limited to 960 pixels wide, quality 65, at the existing
+publication cadence. One full-resolution raw image is retained per preview
+camera and encoded only on snapshot requests. Source dimensions remain intact
+for object/zone setup. This trades raw-image memory for less repetitive JPEG
+work; it does not reduce source decoding or prove lower server CPU until the
+pilot retest. Fullscreen live previews share the 960-pixel limit.
+
+Validation: 53 focused capture, preview, recovery, snapshot and support tests
+passed locally. Windows build and client camera validation remain separate.

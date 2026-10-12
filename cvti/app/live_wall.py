@@ -22,12 +22,14 @@ import cv2
 
 class LiveWall:
     def __init__(self, sources: list[dict], width: int = 400, fps: float = 8.0,
-                 quality: int = 65) -> None:
+                 quality: int = 65, retain_snapshot: bool = False) -> None:
         # sources: [{"id": str, "source": str|int}, ...]
         self.sources = sources
         self.width = width
         self.interval = 1.0 / max(1.0, fps)
         self.quality = quality
+        self.retain_snapshot = retain_snapshot
+        self._raw = {}
         self._latest: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -154,6 +156,9 @@ class LiveWall:
             if not is_file and now < next_publish_at:
                 continue
             next_publish_at = now + self.interval
+            if self.retain_snapshot:
+                with self._lock:
+                    self._raw[cam_id] = frame.copy()
             frame = self._downscale(frame)
             ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
             if ok2:
@@ -192,6 +197,18 @@ class LiveWall:
         with self._lock:
             rec = self._latest.get(cam_id)
             return rec.get("jpeg") if rec and rec.get("ok") else None
+
+    def snapshot(self, cam_id):
+        with self._lock:
+            rec = self._latest.get(cam_id, {})
+            frame = self._raw.get(cam_id) if rec.get("ok") else None
+        if frame is None:
+            return None
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            return None
+        return {"uri": "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode(),
+                "w": int(frame.shape[1]), "h": int(frame.shape[0])}
 
     def stop(self) -> None:
         self._stop.set()
