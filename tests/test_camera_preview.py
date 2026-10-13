@@ -23,6 +23,27 @@ def test_descriptor_is_lazy_and_encoded(preview):
     assert not preview.acquire("unknown")
 
 
+def test_startup_deadline_is_distinct_from_live_stall():
+    from cvti.app.live_wall import FrameServer
+    assert not FrameServer.expired(12, False)
+    assert not FrameServer.expired(30, False)
+    assert FrameServer.expired(31, False)
+    assert FrameServer.expired(6, True)
+
+
+def test_twelve_camera_descriptors_have_distinct_origins():
+    from urllib.parse import urlsplit
+    p = CameraPreview()
+    try:
+        descriptors = [p.descriptor(str(i), "rtsp://example/live") for i in range(12)]
+        assert len({urlsplit(d["url"]).netloc for d in descriptors}) == 12
+        assert p.descriptor("0", "rtsp://example/live") == descriptors[0]
+        assert not p._walls
+        assert all(r["stream_request_count"] == 0 for r in p.diagnostics()["cameras"].values())
+    finally:
+        p.close()
+
+
 def test_viewers_share_capture_and_last_viewer_releases(preview):
     preview.descriptor("cam", 0)
     with patch("cvti.app.preview.LiveWall") as factory:
@@ -112,6 +133,9 @@ def test_preview_scales_jpeg_but_snapshot_keeps_source_resolution():
         wall._decode("cam", "rtsp://test/live")
     preview_frame = cv2.imdecode(np.frombuffer(wall.jpeg("cam"), dtype=np.uint8), 1)
     assert preview_frame.shape[:2] == (540, 960)
+    timings = wall.diagnostics()["cam"]["stage_wall_times"]
+    assert set(timings) == {"read", "resize", "jpeg_encode"}
+    assert all(row["count"] == 1 and row["mean_ms"] >= 0 for row in timings.values())
     snapshot = wall.snapshot("cam")
     assert (snapshot["w"], snapshot["h"]) == (1920, 1080)
     image = cv2.imdecode(np.frombuffer(base64.b64decode(snapshot["uri"].split(",")[1]), dtype=np.uint8), 1)

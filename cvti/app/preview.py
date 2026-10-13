@@ -19,6 +19,8 @@ class CameraPreview:
         self._closed = False
         self._server = FrameServer(self)
         self._server.start()
+        self._servers = {}
+        self._requests = {}
 
     def descriptor(self, camera_id, source):
         with self._lock:
@@ -27,14 +29,23 @@ class CameraPreview:
             if camera_id in self._sources and self._sources[camera_id] != source:
                 raise RuntimeError("camera source changed; reopen preview")
             self._sources[camera_id] = source
+            if camera_id not in self._servers:
+                # Separate origins prevent long-lived MJPEG requests sharing
+                # one browser HTTP/1.1 connection pool across the camera wall.
+                server = self._server if not self._servers else FrameServer(self)
+                if server is not self._server:
+                    server.start()
+                self._servers[camera_id] = server
+            server = self._servers[camera_id]
             return {"kind": "mjpeg", "preview": True,
-                    "url": f"http://127.0.0.1:{self._server.port}/stream/"
-                    f"{quote(camera_id, safe='')}?{urlencode({'token': self._server.token})}"}
+                    "url": f"http://127.0.0.1:{server.port}/stream/"
+                    f"{quote(camera_id, safe='')}?{urlencode({'token': server.token})}"}
 
     def acquire(self, camera_id):
         with self._lock:
             if self._closed or camera_id not in self._sources:
                 return False
+            self._requests[camera_id] = self._requests.get(camera_id, 0) + 1
             if camera_id in self._stopping:
                 wall = self._walls[camera_id]
                 if any(t.is_alive() for t in wall._threads):
@@ -85,6 +96,7 @@ class CameraPreview:
                                     viewers=self._viewers.get(key, 0))
             for key in self._sources:
                 records.setdefault(key, {"active": False, "state": "not_started", "viewers": 0})
+                records[key]["stream_request_count"] = self._requests.get(key, 0)
             for record in records.values():
                 last = record.get("last_decoded_at")
                 record["last_decoded_age_s"] = round(time.time() - last, 2) if last else None
@@ -110,5 +122,8 @@ class CameraPreview:
             stopped = all(not t.is_alive() for wall in self._walls.values()
                           for t in wall._threads)
         self._server.stop()
+        for server in self._servers.values():
+            if server is not self._server:
+                server.stop()
         if not stopped:
             raise PreviewBusy("Camera preview is still releasing its capture; retry monitoring shortly")
