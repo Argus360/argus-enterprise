@@ -4,6 +4,20 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.5 — 13 Oct 2026
+
+**Fisheye cameras are flattened before anything looks at them.** Seven of
+the pilot site's twelve cameras turned out to be fisheye lenses. The
+detector was trained on ordinary pictures, zones drawn on a warped floor
+are curves, and the AI verifier was being asked to judge a distorted scene.
+A camera can now carry a `dewarp` setting in the site file: `panorama`
+unwraps a ceiling-mounted 360 degree lens into a wide strip, `perspective`
+gives a flat view from a wall-mounted one. The image circle is found
+automatically. Detection, the camera wall, the zone editor's snapshot and
+the verifier all see the flattened picture, so a zone drawn in the editor
+lands where the engine detects. A mistyped setting stops the engine at
+start with a message naming the camera, instead of being ignored.
+
 ## v1.10.4 — 13 Oct 2026
 
 **The AI verification settings work in the installed app.** Since v1.10.0
