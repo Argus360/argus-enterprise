@@ -20,6 +20,7 @@ default output sizes, cheaper than decoding the source frame.
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 from cvti.logging_setup import get_logger
@@ -28,6 +29,9 @@ log = get_logger(__name__)
 
 MODES = ("off", "panorama", "perspective")
 PANORAMA_OUTPUT = (1600, 500)
+# How many frames (at most one try a second) the circle finder keeps trying
+# before it settles for the frame centre.
+CIRCLE_ATTEMPTS = 120
 PERSPECTIVE_OUTPUT = (1280, 800)
 # Pixels darker than this (0-255 grey) count as the black border around the
 # image circle when the circle has to be found from a frame.
@@ -70,6 +74,15 @@ class Dewarp:
         self.auto_circle = self.center is None or self.radius is None
         self._maps = None            # (mx, my) for the current source size
         self._source_size = None     # (w, h) the maps were built for
+        # Auto-circle state. The first frames a decoder hands out are often
+        # grey placeholders (HEVC before its first keyframe), and on the pilot
+        # server the finder saw those, fell back to a centred guess and never
+        # looked again (13 Oct 2026). Now the guess is provisional: the finder
+        # keeps trying, at most once a second, until a real circle is found or
+        # it has tried CIRCLE_ATTEMPTS times.
+        self._circle_settled = not self.auto_circle
+        self._circle_attempts = 0
+        self._circle_last_try = 0.0
 
     # --- construction -------------------------------------------------------
     @classmethod
@@ -92,7 +105,8 @@ class Dewarp:
 
     def describe(self) -> dict:
         return {"mode": self.mode, "center": self.center, "radius": self.radius,
-                "output": list(self.output), "auto_circle": self.auto_circle}
+                "output": list(self.output), "auto_circle": self.auto_circle,
+                "circle_settled": self._circle_settled}
 
     # --- the circle ---------------------------------------------------------
     @staticmethod
@@ -102,6 +116,8 @@ class Dewarp:
         import cv2
         import numpy as np
         grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        if float(grey.std()) < 4.0:
+            return None                     # a flat grey/black placeholder, not a picture
         grey = cv2.GaussianBlur(grey, (0, 0), 3)
         mask = (grey > _BORDER_LEVEL).astype(np.uint8)
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
@@ -116,20 +132,25 @@ class Dewarp:
         r = float(max(xs.max() - cx, cx - xs.min(), ys.max() - cy, cy - ys.min()))
         return cx, cy, r
 
-    def _settle_circle(self, frame) -> None:
+    def _settle_circle(self, frame) -> bool:
+        """Find the circle in this frame. True when it was found (settled);
+        False when a provisional centred guess is in place instead."""
         if not self.auto_circle:
-            return
+            return True
         h, w = frame.shape[:2]
         found = self.find_circle(frame)
+        self._circle_attempts += 1
         if found is None:
-            log.warning("[dewarp] no image circle found in a %dx%d frame; assuming the "
-                        "lens fills the frame", w, h)
-            found = (w / 2.0, h / 2.0, min(w, h) / 2.0)
+            if self.center is None or self.radius is None:
+                self.center, self.radius = (w / 2.0, h / 2.0), min(w, h) / 2.0
+                log.info("[dewarp] no image circle in the first %dx%d frame (placeholder "
+                         "or no border); using the frame centre until one is found", w, h)
+            return False
         cx, cy, r = found
-        self.center = self.center or (cx, cy)
-        self.radius = self.radius or r
+        self.center, self.radius = (cx, cy), r
         log.info("[dewarp] image circle centre=(%.0f, %.0f) radius=%.0f in %dx%d",
-                 self.center[0], self.center[1], self.radius, w, h)
+                 cx, cy, r, w, h)
+        return True
 
     # --- the maps -----------------------------------------------------------
     def _build_maps(self) -> None:
@@ -173,14 +194,28 @@ class Dewarp:
         """The dewarped frame. Maps are built on the first frame (and again if
         the source size changes); the circle is found then when not given."""
         import cv2
+
         h, w = frame.shape[:2]
         if self._maps is None or self._source_size != (w, h):
             if self._source_size is not None and self.auto_circle:
                 self.center = None          # a new source size: find the circle again
                 self.radius = None
-            self._settle_circle(frame)
+                self._circle_settled = False
+                self._circle_attempts = 0
+            self._circle_settled = self._settle_circle(frame)
+            self._circle_last_try = time.monotonic()
             self._build_maps()
             self._source_size = (w, h)
+        elif (not self._circle_settled and self._circle_attempts < CIRCLE_ATTEMPTS
+              and time.monotonic() - self._circle_last_try >= 1.0):
+            self._circle_last_try = time.monotonic()
+            if self._settle_circle(frame):
+                self._circle_settled = True
+                self._build_maps()
+            elif self._circle_attempts >= CIRCLE_ATTEMPTS:
+                log.warning("[dewarp] no image circle found in %d frames of %dx%d; keeping "
+                            "the frame centre (set center and radius in the site file)",
+                            CIRCLE_ATTEMPTS, w, h)
         mx, my = self._maps
         return cv2.remap(frame, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 

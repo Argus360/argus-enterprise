@@ -69,6 +69,45 @@ class PanoramaTests(unittest.TestCase):
         self.assertAlmostEqual(dw.describe()["center"][0], 820, delta=3)
 
 
+class PlaceholderFirstFrameTests(unittest.TestCase):
+    """A decoder's first frames can be flat grey (HEVC before its first
+    keyframe). The pilot server locked a centred guess on those (13 Oct)."""
+
+    def test_a_flat_frame_is_not_a_circle(self):
+        self.assertIsNone(Dewarp.find_circle(np.full((600, 800, 3), 128, np.uint8)))
+
+    def test_the_circle_is_found_on_a_later_frame_and_the_maps_rebuilt(self):
+        from cvti.serving import dewarp as dw_mod
+        dw = Dewarp.from_config({"mode": "panorama", "output": [720, 240]})
+        grey = np.full((600, 800, 3), 128, np.uint8)
+        out = dw.apply(grey)
+        self.assertEqual(out.shape, (240, 720, 3))
+        self.assertFalse(dw.describe()["circle_settled"])
+        self.assertEqual(dw.describe()["center"], (400.0, 300.0))   # provisional
+        with mock.patch.object(dw_mod.time, "monotonic", side_effect=[10.0, 10.0, 20.0, 20.0, 30.0, 30.0]):
+            dw.apply(grey)                        # still a placeholder: keeps trying
+            self.assertFalse(dw.describe()["circle_settled"])
+            dw.apply(fisheye_frame())             # a real frame: settles and rebuilds
+        self.assertTrue(dw.describe()["circle_settled"])
+        self.assertAlmostEqual(dw.describe()["center"][0], CX, delta=2)
+        self.assertAlmostEqual(dw.describe()["radius"], R, delta=3)
+        # and it stops looking once settled
+        before = dw._circle_attempts
+        dw.apply(fisheye_frame())
+        self.assertEqual(dw._circle_attempts, before)
+
+    def test_it_gives_up_after_the_attempt_budget(self):
+        from cvti.serving import dewarp as dw_mod
+        dw = Dewarp.from_config({"mode": "panorama", "output": [720, 240]})
+        grey = np.full((600, 800, 3), 128, np.uint8)
+        clock = iter(float(t) for t in range(0, 10000, 2))
+        with mock.patch.object(dw_mod.time, "monotonic", side_effect=lambda: next(clock)):
+            for _ in range(dw_mod.CIRCLE_ATTEMPTS + 5):
+                dw.apply(grey)
+        self.assertFalse(dw.describe()["circle_settled"])
+        self.assertEqual(dw._circle_attempts, dw_mod.CIRCLE_ATTEMPTS)
+
+
 class PerspectiveTests(unittest.TestCase):
     def test_the_view_centre_is_the_circle_centre(self):
         dw = Dewarp.from_config({"mode": "perspective", "output": [640, 400], "fov": 100})
