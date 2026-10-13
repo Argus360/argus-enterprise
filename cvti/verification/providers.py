@@ -46,6 +46,9 @@ class Provider:
     # (OPENROUTER_API_KEY vs OPENAI_API_KEY), so one key may fan out to two.
     key_envs: tuple[str, ...] = field(default=())
     note: str = ""
+    # Most images one request may carry, when the provider documents a limit.
+    # None = send every evidence frame (the gate's default).
+    max_frames: int | None = None
 
     @property
     def needs_key(self) -> bool:
@@ -79,10 +82,15 @@ PROVIDERS: dict[str, Provider] = {
              "OpenRouter privacy settings before sending customer frames."),
     "groq": Provider(
         id="groq", label="Groq", engine_provider="openai_compatible",
-        default_model="meta-llama/llama-4-scout-17b-16e-instruct", base_url=GROQ_BASE_URL,
+        default_model="qwen/qwen3.8-27b", base_url=GROQ_BASE_URL,
         key_env="OPENAI_API_KEY", key_envs=("OPENAI_API_KEY",),
         mapper=("openai_compatible", GROQ_BASE_URL),
-        note="Fast open models with a free tier that does not train on inputs."),
+        # Groq caps a request at 3 images and bills 2,048 tokens each; the free
+        # tier is 8,000 tokens a minute and 200,000 a day, about one verdict a
+        # minute and under thirty a day with three frames.
+        max_frames=3,
+        note="Fast open models; the free tier does not train on inputs but allows "
+             "about 30 verdicts a day with images. Good for a test, thin for a site."),
     "gemini": Provider(
         id="gemini", label="Google Gemini", engine_provider="openai_compatible",
         default_model="gemini-2.5-flash-lite", base_url=GEMINI_BASE_URL,
@@ -130,6 +138,8 @@ def engine_args(settings: dict) -> list[str]:
     base_url = settings.get("base_url") or spec.base_url
     if base_url and spec.engine_provider == "openai_compatible":
         args += ["--gate-base-url", base_url]
+    if spec.max_frames:
+        args += ["--gate-max-frames", str(spec.max_frames)]
     mapper_provider, mapper_base = spec.mapper
     if spec.id == "custom":
         mapper_base = base_url

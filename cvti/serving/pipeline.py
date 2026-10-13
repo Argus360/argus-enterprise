@@ -1018,6 +1018,16 @@ def warm_gate_model_async(gate_provider: str, gate_model: str,
     return thread
 
 
+def _apply_gate_frame_cap(site: dict, gate_max_frames: int | None) -> dict:
+    """A provider's image limit becomes the gate's frame cap unless the site
+    already chose one. Groq refuses requests with more than three images
+    (qwen3.8-27b, Oct 2026); the evidence builder sends four to six, so
+    without this every verdict there would be a 400 and land UNVERIFIED."""
+    if gate_max_frames and not site.get("gate_max_frames"):
+        site["gate_max_frames"] = int(gate_max_frames)
+    return site
+
+
 def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
              target_fps: float = 5.0, imgsz: int = 640, conf: float = 0.4,
              device: str = "", half: bool = False, seconds: float = 90.0,
@@ -1033,7 +1043,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
              baseline_config: str | None = "configs/baseline_critical_v1.json",
              notify: str = "console", output_dir: str = "runs/serving",
              gate_workers: int = 0, gate_drain: float = 180.0,
-             mobile_port: int = 8710) -> None:
+             mobile_port: int = 8710, gate_max_frames: int | None = None) -> None:
     """End-to-end multi-camera run: shared batched detector + shared pose/weapon
     models -> per-camera track/zones/concealment/violence/weapons/theft/rules ->
     shared alert queue -> async VLM gate."""
@@ -1051,6 +1061,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
         log.info(f"[site] *** {MOCK_GATE_BANNER} *** every alert will be confirmed WITHOUT verification.")
 
     site = load_site_config(site_config_path)
+    _apply_gate_frame_cap(site, gate_max_frames)
     # Heartbeat THROUGH the slow parts, not just before them: the preflight
     # alone can run minutes on a fresh install (mapper timing out against a
     # model still downloading), and a single stale write would read as a
@@ -1123,6 +1134,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
         # Reload the config: a camera added (or a context approved) from the
         # app while we wait must start cameras WITHOUT an engine restart.
         site = load_site_config(site_config_path)
+        _apply_gate_frame_cap(site, gate_max_frames)
         mapping_preflight = _preflight()
         cams_cfg = active_cameras_after_preflight(
             list(site.get("cameras") or []), mapping_preflight
@@ -2102,6 +2114,9 @@ def main() -> None:
     p.add_argument("--gate-provider", default="mock")
     p.add_argument("--gate-model", default="")
     p.add_argument("--gate-base-url", default="")
+    p.add_argument("--gate-max-frames", type=int, default=0,
+                   help="Most images per verdict the provider accepts (0 = no cap). "
+                        "The site's own gate_max_frames wins when set.")
     p.add_argument("--mapper-provider", default="",
                    help="Scene mapper provider; empty inherits the local gate provider.")
     p.add_argument("--mapper-model", default="",
@@ -2188,7 +2203,8 @@ def main() -> None:
                  mapper_model=args.mapper_model,
                  mapper_base_url=args.mapper_base_url,
                  notify=_notify_for(args), output_dir=args.output_dir,
-                 gate_workers=args.gate_workers, gate_drain=args.gate_drain)
+                 gate_workers=args.gate_workers, gate_drain=args.gate_drain,
+                 gate_max_frames=args.gate_max_frames or None)
         return
 
     if not args.sources:
