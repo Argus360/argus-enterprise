@@ -2482,7 +2482,7 @@ class ConsoleBackend:
         from cvti.app.preview import CameraPreview
         if getattr(self, "_preview", None) is None:
             self._preview = CameraPreview()
-        return self._preview.descriptor(camera_id, cam["source"])
+        return self._preview.descriptor(camera_id, cam["source"], dewarp=cam.get("dewarp"))
 
     def _live_sources(self, count: int) -> list[dict]:
         """Sources for the live grid: the site's file/RTSP cameras if configured,
