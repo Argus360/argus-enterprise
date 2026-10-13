@@ -4,6 +4,15 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.6 — 13 Oct 2026
+
+**Web and HLS cameras no longer cost a second encode.** A camera whose
+address starts with http or https went through the video relay, which
+cannot pass such a stream through and so re-encoded it in full before the
+engine decoded it again. One public feed took almost half a laptop's
+processor in the relay alone. Those cameras now go straight to the engine,
+as they did before the relay existed; RTSP cameras are unchanged.
+
 ## v1.10.5 — 13 Oct 2026
 
 **Fisheye cameras are flattened before anything looks at them.** Seven of
