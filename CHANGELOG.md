@@ -4,6 +4,16 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.4 — 13 Oct 2026
+
+**The AI verification settings work in the installed app.** Since v1.10.0
+the settings panel and the setup wizard offered a choice of verifier, but
+the installed app refused the request behind it with "Invalid engine
+request", so no provider or key could be entered. The app's own list of
+permitted requests had not been updated. It now follows the full list
+automatically, and a test keeps it that way. Install this over v1.10.3
+before entering a key.
+
 ## v1.10.3 — 13 Oct 2026
 
 The camera wall while monitoring runs, from the pilot server's own
