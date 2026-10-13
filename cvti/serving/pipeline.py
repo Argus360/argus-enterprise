@@ -402,8 +402,12 @@ class MultiStreamPipeline:
                  detector_backend: str = "torch",
                  object_watch_runtime: Any = None,
                  camera_inference: dict | None = None,
-                 synchronized_box_cameras: set[str] | None = None) -> None:
+                 synchronized_box_cameras: set[str] | None = None,
+                 camera_dewarp: dict | None = None) -> None:
         self.synchronized_box_cameras = set(synchronized_box_cameras or ())
+        # camera_id -> Dewarp (cvti.serving.dewarp): fisheye cameras are
+        # flattened in the decoder, before any consumer sees a frame.
+        self.camera_dewarp: dict = dict(camera_dewarp or {})
         from cvti.serving.camera_inference import CameraInference
         self._camera_inference = CameraInference(camera_inference)
         self.sources = sources
@@ -529,7 +533,8 @@ class MultiStreamPipeline:
             self._decoders[cam_id] = StreamDecoder(
                 cam_id, src, target_fps=(1.0 if vo else self.target_fps),
                 on_state_change=self._handle_link_change, view_only=vo,
-                fallback_source=self.fallback_sources.get(cam_id)).start()
+                fallback_source=self.fallback_sources.get(cam_id),
+                dewarp=self.camera_dewarp.get(cam_id)).start()
         if self.smooth_publish:
             import threading as _th
             self._smooth_thread = _th.Thread(target=self._smooth_publish_loop,
@@ -1404,6 +1409,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                        else f"Camera {cam_id} is back online")),
                      "frames": [], "scene": {}, "enqueued_at": time.time()}))
 
+    from cvti.serving.dewarp import dewarps_for as _dewarps_for
     pipe = MultiStreamPipeline(sources, weights=weights, target_fps=target_fps, imgsz=imgsz,
                                conf=conf, device=device, half=half, camera_states=states,
                                alert_queue=queue, publisher=publisher,
@@ -1416,7 +1422,8 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                                  for c in site.get("cameras", [])
                                                  if "detection_inference" in c},
                                synchronized_box_cameras={str(c["id"]) for c in site.get("cameras", [])
-                                                         if c.get("box_display") == "synchronized"})
+                                                         if c.get("box_display") == "synchronized"},
+                               camera_dewarp=_dewarps_for(site.get("cameras", [])))
 
     def _fast_path(alert) -> None:
         """Two-tier alerting (EP-06-T4): criticals are shown provisionally the

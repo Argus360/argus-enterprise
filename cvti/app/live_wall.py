@@ -30,6 +30,12 @@ class LiveWall:
         self.quality = quality
         self.retain_snapshot = retain_snapshot
         self._raw = {}
+        # Fisheye cameras are flattened here too, BEFORE the snapshot the zone
+        # editor draws on, so zones drawn while monitoring is stopped land on
+        # the same geometry the engine detects in.
+        from cvti.serving.dewarp import Dewarp
+        self._dewarp = {s["id"]: Dewarp.from_config(s.get("dewarp")) for s in sources
+                        if isinstance(s, dict)}
         self._latest: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -149,6 +155,12 @@ class LiveWall:
                     self._stop.wait(0.3)
                     continue
             dead_since = 0.0
+            dewarp = self._dewarp.get(cam_id)
+            if dewarp is not None:
+                try:
+                    frame = dewarp.apply(frame)
+                except Exception:  # noqa: BLE001 - a bad frame must not stop the preview
+                    log.debug("preview dewarp failed on a frame", exc_info=True)
             observed = time.time()
             self._record(cam_id, "receiving", last_decoded_at=observed, failure=None)
             with self._lock:

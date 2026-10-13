@@ -12,6 +12,7 @@ class CameraPreview:
     def __init__(self):
         self._lock = threading.RLock()
         self._sources = {}
+        self._dewarp = {}            # camera_id -> site dewarp block, for the wall it opens
         self._walls = {}
         self._viewers = {}
         self._history = {}
@@ -22,13 +23,14 @@ class CameraPreview:
         self._servers = {}
         self._requests = {}
 
-    def descriptor(self, camera_id, source):
+    def descriptor(self, camera_id, source, dewarp=None):
         with self._lock:
             if self._closed:
                 raise RuntimeError("preview is closing")
             if camera_id in self._sources and self._sources[camera_id] != source:
                 raise RuntimeError("camera source changed; reopen preview")
             self._sources[camera_id] = source
+            self._dewarp[camera_id] = dewarp
             if camera_id not in self._servers:
                 # Separate origins prevent long-lived MJPEG requests sharing
                 # one browser HTTP/1.1 connection pool across the camera wall.
@@ -55,7 +57,8 @@ class CameraPreview:
                 self._stopping.discard(camera_id)
             if camera_id not in self._walls:
                 self._walls[camera_id] = LiveWall(
-                    [{"id": camera_id, "source": self._sources[camera_id]}],
+                    [{"id": camera_id, "source": self._sources[camera_id],
+                      "dewarp": self._dewarp.get(camera_id)}],
                     width=960, fps=8, quality=65, retain_snapshot=True).start()
             self._viewers[camera_id] = self._viewers.get(camera_id, 0) + 1
             return True

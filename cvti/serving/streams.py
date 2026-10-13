@@ -155,9 +155,14 @@ class StreamDecoder:
                  loop_files: bool = True, offline_grace_seconds: float = DEFAULT_OFFLINE_GRACE,
                  on_state_change=None, view_only: bool = False,
                  fallback_source: int | str | None = None,
-                 relay_retry_seconds: float = 60.0) -> None:
+                 relay_retry_seconds: float = 60.0,
+                 dewarp: Any = None) -> None:
         self.camera_id = camera_id
         self.source = source
+        # A fisheye camera's Dewarp (cvti.serving.dewarp). Applied to every
+        # frame before it is stored, so detection, the wall, zones and the
+        # verifier all see the flattened frame and agree on its geometry.
+        self.dewarp = dewarp
         # W1.3: when `source` is the go2rtc restream, this is the camera's own
         # URL. A gateway that dies must cost this camera a reconnect, never
         # its coverage — after two straight failed reopens the decoder swaps
@@ -403,6 +408,12 @@ class StreamDecoder:
             if ok:
                 ok, image = cap.read()
                 orig_index += 1
+            if ok and self.dewarp is not None:
+                try:
+                    image = self.dewarp.apply(image)
+                except Exception:  # noqa: BLE001 - a bad frame must not stop the camera
+                    log.warning("[decode %s] dewarp failed on a frame; passing it through",
+                                self.camera_id, exc_info=True)
             if ok:
                 # What one kept frame COSTS on this machine (grabs + decode,
                 # wall time) — feeds the adaptive ingest cap.
