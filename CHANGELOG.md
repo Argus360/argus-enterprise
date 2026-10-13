@@ -4,6 +4,39 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.3 — 13 Oct 2026
+
+The camera wall while monitoring runs, from the pilot server's own
+diagnostics. Install this one.
+
+**All tiles connect, however many cameras.** Every tile on the wall used to
+share one connection point on the engine, and a browser allows six open
+connections to one point. With seven cameras that cannot play over WebRTC
+(HEVC), the seventh and later tiles waited for one of the first six to
+close, which on a wall never happens. Each camera now has its own, so
+thirteen tiles open thirteen connections.
+
+**A tile reconnects itself.** A WebRTC feed that dropped sat on its last
+picture until the wall was reopened. The tile now notices a failed or closed
+connection and reconnects, and a connected feed that stops delivering
+pictures for ten seconds while the camera itself is healthy is reconnected
+too.
+
+**A camera hiccup no longer blanks the tile.** When the engine reported a
+camera offline, the tile was torn down and rebuilt five seconds later even
+while pictures were still arriving. That was the flapping. The tile now
+stays on its last picture with an OFFLINE badge and a note; only a tile that
+never received a picture goes dark.
+
+**Stop leaves nothing stale.** Stopping monitoring left two files behind
+that pointed every tile at a port that no longer existed, until the next
+Start. They are removed on Stop.
+
+**Cameras return to the relay.** A camera that lost the relay once was
+decoded straight from the camera for the rest of the run, which meant two
+video sessions on that camera and a heavier network. The engine now checks
+the relay once a minute and moves back when it answers.
+
 ## v1.10.2 — 13 Oct 2026
 
 **Groq works as a verifier.** Groq accepts at most three images per
