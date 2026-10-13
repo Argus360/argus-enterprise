@@ -74,6 +74,9 @@ class ProviderCatalogue(unittest.TestCase):
         self.assertEqual(args[args.index("--gate-provider") + 1], "openai_compatible")
         self.assertEqual(args[args.index("--gate-base-url") + 1], providers.GROQ_BASE_URL)
         self.assertNotIn("--mapper-provider", args)   # same provider, same URL: nothing to override
+        # Groq accepts at most three images per request: the cap rides along.
+        self.assertEqual(args[args.index("--gate-max-frames") + 1], "3")
+        self.assertNotIn("--gate-max-frames", providers.engine_args(providers.normalize_settings({"provider": "openrouter"})))
 
         args = providers.engine_args(providers.normalize_settings({"provider": "openrouter"}))
         self.assertEqual(args[args.index("--gate-provider") + 1], "openrouter")
@@ -260,6 +263,15 @@ class TheGateOnACloud(unittest.TestCase):
             gate._call_provider("prompt", [b"a", b"b"], alert)
         self.assertEqual(call.call_args.kwargs["frame_bytes"], b"a")
         self.assertEqual(call.call_args.kwargs["api_key_env"], "")
+
+
+class ProviderFrameCap(unittest.TestCase):
+    def test_provider_cap_applies_unless_the_site_chose_its_own(self):
+        from cvti.serving.pipeline import _apply_gate_frame_cap
+        self.assertEqual(_apply_gate_frame_cap({}, 3)["gate_max_frames"], 3)
+        self.assertEqual(_apply_gate_frame_cap({"gate_max_frames": 2}, 3)["gate_max_frames"], 2)
+        self.assertNotIn("gate_max_frames", _apply_gate_frame_cap({}, None))
+        self.assertNotIn("gate_max_frames", _apply_gate_frame_cap({}, 0))
 
 
 class EverythingFollowsTheGate(unittest.TestCase):
