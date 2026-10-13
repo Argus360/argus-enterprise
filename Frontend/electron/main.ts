@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import readline from "node:readline";
-import type { ArgusApiClient } from "./api-client.js";
+import { API_OPERATIONS, type ArgusApiClient } from "./api-client.js";
 import { createOwnedApiClient, createSmokeStateWriter } from "./api-runtime.js";
 import { startOwnedApi, type OwnedApi } from "./api-supervisor.js";
 import { createSupportLog } from "./support-log.js";
@@ -187,6 +187,11 @@ for (const method of [
   "hierarchy",
 ])
   methods.add(method);
+// Every route the API client knows is callable. The hand-written list above
+// drifted from the client twice: the cloud verifier (v1.10.0) and the vehicle
+// line shipped with their routes but not here, so the packaged app answered
+// "Invalid engine request" to its own settings panel (CHI, 13 Oct 2026).
+for (const method of API_OPERATIONS) methods.add(method);
 function failPending(message: string) {
   for (const item of pending.values()) {
     clearTimeout(item.timer);
