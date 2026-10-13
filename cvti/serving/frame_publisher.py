@@ -95,6 +95,17 @@ class FramePublisher:
         self._marker: Path | None = None    # <output_dir>/frames.json, ours to remove
         self.port = 0
         self.published = 0
+        # One extra loopback port per camera (W1 wall). A browser opens at
+        # most six connections to one host:port, and every MJPEG tile holds
+        # one open for as long as it is watched — so on one port the seventh
+        # tile waited for one of the first six to close, which on a wall
+        # never happens (CHI, 11 Oct 2026: 7 of 12 cameras stream HEVC, which
+        # Chromium cannot play over WebRTC, so they all took this path). Same
+        # handler, same token, same frames; only the port differs, and the
+        # shared port keeps serving everything for any client that uses it.
+        self._handler: Any = None
+        self._camera_servers: dict[str, Any] = {}
+        self.camera_ports: dict[str, int] = {}
 
     # --- engine side ------------------------------------------------------
     def publish(self, camera_id: str, frame: Any,
@@ -500,7 +511,11 @@ class FramePublisher:
                     "published": self.published}
 
     # --- server -----------------------------------------------------------
-    def start(self, output_dir: str | Path | None = None) -> "FramePublisher":
+    def start(self, output_dir: str | Path | None = None,
+              cameras: Sequence[str] = ()) -> "FramePublisher":
+        """Serve. `cameras` get a port each (see camera_ports); the rest use
+        the shared one. frames.json is written once every port is listening,
+        so a reader never sees a half-made map."""
         pub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -623,31 +638,66 @@ class FramePublisher:
                 else:
                     self._send(404, b"not found", "text/plain")
 
+        self._handler = Handler
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         name="frame-publisher", daemon=True)
         self._thread.start()
+        for camera_id in cameras:
+            self._ensure_camera_server(str(camera_id))
         if output_dir:                          # so the app can find us
-            p = self._marker = Path(output_dir) / "frames.json"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps({"port": self.port, "token": self.token}))
-            try:
-                # The token is a credential. Anyone who can read this file can
-                # read the cameras, so do not let that be everyone on the box.
-                os.chmod(p, 0o600)
-            except OSError:
-                log.warning("[frames] could not restrict permissions on %s", p,
-                            exc_info=True)
+            self._write_marker(Path(output_dir) / "frames.json")
         log.info(f"[frames] publishing on http://127.0.0.1:{self.port} "
-              f"(boxes={'on' if self.draw_boxes else 'off'})")
+              f"(boxes={'on' if self.draw_boxes else 'off'}, "
+              f"{len(self.camera_ports)} per-camera port(s))")
         return self
+
+    def _ensure_camera_server(self, camera_id: str) -> int:
+        with self._lock:
+            port = self.camera_ports.get(camera_id)
+        if port:
+            return port
+        server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler)
+        threading.Thread(target=server.serve_forever,
+                         name=f"frame-publisher:{camera_id}", daemon=True).start()
+        with self._lock:
+            self._camera_servers[camera_id] = server
+            self.camera_ports[camera_id] = server.server_address[1]
+            return self.camera_ports[camera_id]
+
+    def port_for(self, camera_id: str) -> int:
+        """The port this camera's tile should open; the shared port when the
+        camera was not given one of its own."""
+        return self.camera_ports.get(camera_id) or self.port
+
+    def _write_marker(self, path: Path) -> None:
+        self._marker = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"port": self.port, "token": self.token,
+                                    "ports": dict(self.camera_ports)}))
+        try:
+            # The token is a credential. Anyone who can read this file can
+            # read the cameras, so do not let that be everyone on the box.
+            os.chmod(path, 0o600)
+        except OSError:
+            log.warning("[frames] could not restrict permissions on %s", path,
+                        exc_info=True)
 
     def stop(self) -> None:
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
             self._server = None
+        with self._lock:
+            servers, self._camera_servers = self._camera_servers, {}
+            self.camera_ports = {}
+        for server in servers.values():
+            try:
+                server.shutdown()
+                server.server_close()
+            except OSError:
+                pass
         # Like stream_gateway.json: the file existing IS the publisher being
         # alive. It used to outlive the engine, and every run listens on a new
         # port — so after Stop the app resolved a dead URL and every tile read

@@ -2784,7 +2784,22 @@ class ConsoleBackend:
             reap_stale(Path(self.db_path).parent)
         except Exception:  # noqa: BLE001 - stopping must not fail over a helper
             log.debug("go2rtc clean-up after stop failed", exc_info=True)
+        # The engine removes frames.json and stream_gateway.json when it exits
+        # on its own; the terminate above never gives it the chance, and a
+        # stale marker points every tile at a dead port until the next Start
+        # — the wall after Stop on the pilot server (11 Oct 2026). The process
+        # is gone, so the files are ours to remove.
+        self._remove_engine_markers()
         return {"running": False}
+
+    def _remove_engine_markers(self) -> None:
+        for name in ("frames.json", "stream_gateway.json"):
+            try:
+                (Path(self.db_path).parent / name).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                log.debug("could not remove stale %s after stop", name, exc_info=True)
 
     @property
     def crash_looped(self) -> bool:

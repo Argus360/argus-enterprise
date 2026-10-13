@@ -78,12 +78,50 @@ test("actual MJPEG onLoad gates live status and health rerenders override it", a
 
   await render(page, { state: "offline", descriptor });
   await expect(page.locator(".media-label")).toHaveText("OFFLINE");
-  await expect(
-    page.getByText("Camera health reports that this feed is offline."),
-  ).toBeVisible();
+  // The image already received stays on screen; the badge says offline.
+  await expect(page.locator(".camera-media > img")).toBeVisible();
+  await expect(page.locator(".media-banner")).toHaveText(
+    "Camera offline. Showing the last image received.",
+  );
 
   await render(page, { state: "reconnecting", descriptor });
   await expect(page.locator(".media-label")).toHaveText("RECONNECTING");
+  await expect(page.locator(".camera-media > img")).toBeVisible();
+});
+
+test("health offline before any image is an offline tile that keeps asking", async ({
+  page,
+}) => {
+  await page.route("**/never.mjpeg", () => {});
+  await openHarness(page);
+  await render(page, { state: "offline", descriptor: { kind: "mjpeg", url: "/never.mjpeg" } });
+  await expect(page.locator(".media-label")).toHaveText("OFFLINE");
+  await expect(
+    page.getByText("Camera health reports that this feed is offline."),
+  ).toBeVisible();
+  await expect(page.locator(".camera-media > img")).toHaveCount(0);
+});
+
+test("a WebRTC peer that fails is renegotiated by the tile itself", async ({ page }) => {
+  await page.route("**/whep", (route) => route.fulfill({ body: "answer" }));
+  await openHarness(page);
+  const descriptor = { kind: "webrtc", url: "http://127.0.0.1:5173/whep" };
+  await render(page, { state: "connected", descriptor });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).cameraHarness.emitTrack()))
+    .toBe(true);
+  await expect(page.locator(".media-label")).toHaveText("WEBRTC FEED");
+  const before = await page.evaluate(() => (window as any).cameraHarness.peersMade());
+
+  await page.evaluate(() => (window as any).cameraHarness.setConnection("failed"));
+  await expect(page.locator(".media-label")).toHaveText("CONNECTING");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).cameraHarness.peersMade()))
+    .toBe(before + 1);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).cameraHarness.emitTrack()))
+    .toBe(true);
+  await expect(page.locator(".media-label")).toHaveText("WEBRTC FEED");
 });
 
 test("actual WebRTC ontrack gates live status and degraded health overrides it", async ({

@@ -37,6 +37,11 @@ class ReapStaleTest(unittest.TestCase):
     def test_no_pidfile_is_a_noop(self):
         self.assertEqual(g.reap_stale(self.out), 0)
 
+    def test_reap_stale_retracts_a_dead_gateways_advertisement(self):
+        (self.out / "stream_gateway.json").write_text('{"api_port": 2}')
+        g.reap_stale(self.out)
+        self.assertFalse((self.out / "stream_gateway.json").exists())
+
     def test_a_leftover_gateway_is_stopped_and_the_pidfile_removed(self):
         proc = _fake_gateway(self.out)
         try:
@@ -91,6 +96,23 @@ class StopEngineReapsTest(unittest.TestCase):
         with patch("cvti.serving.go2rtc.reap_stale") as reap:
             be._stop_engine()
         reap.assert_called_once_with(Path(be.db_path).parent)
+
+    def test_stop_monitoring_removes_the_markers_a_killed_engine_left(self):
+        """frames.json and stream_gateway.json say "a publisher/gateway is
+        alive here". After a hard terminate the engine never removes them, so
+        every tile resolved a dead port until the next Start (11 Oct 2026)."""
+        from cvti.app.console_backend import ConsoleBackend
+        be = ConsoleBackend.__new__(ConsoleBackend)
+        be._monitor = None
+        out = Path(tempfile.mkdtemp())
+        be.db_path = str(out / "events.db")
+        (out / "frames.json").write_text('{"port": 1, "token": "t"}')
+        (out / "stream_gateway.json").write_text('{"api_port": 2}')
+        with patch("cvti.serving.go2rtc.reap_stale"):
+            be._stop_engine()
+        self.assertFalse((out / "frames.json").exists())
+        self.assertFalse((out / "stream_gateway.json").exists())
+        be._stop_engine()                     # nothing left: still fine
 
 
 if __name__ == "__main__":

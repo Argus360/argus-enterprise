@@ -558,6 +558,17 @@ main {
   border-radius: 3px;
   pointer-events: none;
 }
+.media-banner {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #101b17bd;
+  color: #f0f5f1;
+  font-size: 9px;
+  padding: 4px 8px;
+  pointer-events: none;
+}
 .media-open {
   position: absolute;
   top: 8px;

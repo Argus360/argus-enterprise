@@ -566,7 +566,8 @@ class SmoothPublishTest(unittest.TestCase):
         import inspect
         from cvti.serving import pipeline as pl
         src = inspect.getsource(pl.run_site)
-        self.assertIn("FramePublisher().start(output_dir)", src)
+        self.assertIn("FramePublisher().start(", src)       # default publisher: no boxes
+        self.assertIn("cameras=", src)                      # one port per camera (W1 wall)
         loop = inspect.getsource(pl.MultiStreamPipeline._smooth_publish_loop)
         self.assertNotIn("latest_boxes", loop)
 

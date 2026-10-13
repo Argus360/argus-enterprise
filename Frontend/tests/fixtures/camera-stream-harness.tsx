@@ -7,12 +7,16 @@ const listeners = new Set<(event: PushEvent) => void>();
 let descriptor: StreamDescriptor;
 let failOffer = false;
 let latestPeer: FakePeer | undefined;
+let peersMade = 0;
 
-class FakePeer {
+class FakePeer extends EventTarget {
   ontrack: RTCPeerConnection["ontrack"] = null;
   localDescription: RTCSessionDescriptionInit | null = null;
+  connectionState: RTCPeerConnectionState = "new";
   constructor() {
+    super();
     latestPeer = this;
+    peersMade += 1;
   }
   addTransceiver() {}
   async createOffer() {
@@ -60,6 +64,15 @@ const root = createRoot(document.getElementById("root")!);
         active={options.active ?? true}
       />,
     );
+  },
+  peersMade() {
+    return peersMade;
+  },
+  setConnection(state: RTCPeerConnectionState) {
+    if (!latestPeer) return false;
+    latestPeer.connectionState = state;
+    latestPeer.dispatchEvent(new Event("connectionstatechange"));
+    return true;
   },
   emitTrack() {
     if (!latestPeer?.ontrack) return false;

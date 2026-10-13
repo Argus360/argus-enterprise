@@ -337,7 +337,10 @@ def create_app(*, db_path: str = "runs/site/events.db",
             query = {"token": pub["token"]}
             if tracking:
                 query = {"tracking": 1, **query}
-            mjpeg = (f"http://127.0.0.1:{pub['port']}/stream/"
+            # Per-camera port when the publisher made one (W1 wall): twelve
+            # tiles on one origin queue behind the browser's six-per-host cap.
+            port = (pub.get("ports") or {}).get(camera_id) or pub["port"]
+            mjpeg = (f"http://127.0.0.1:{port}/stream/"
                      f"{quote(camera_id, safe='')}?{urlencode(query)}")
         except (OSError, ValueError, KeyError):
             pass

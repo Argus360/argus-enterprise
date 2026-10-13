@@ -154,17 +154,31 @@ class StreamDecoder:
                  reconnect: bool = True, reconnect_backoff: float = 1.0,
                  loop_files: bool = True, offline_grace_seconds: float = DEFAULT_OFFLINE_GRACE,
                  on_state_change=None, view_only: bool = False,
-                 fallback_source: int | str | None = None) -> None:
+                 fallback_source: int | str | None = None,
+                 relay_retry_seconds: float = 60.0) -> None:
         self.camera_id = camera_id
         self.source = source
         # W1.3: when `source` is the go2rtc restream, this is the camera's own
         # URL. A gateway that dies must cost this camera a reconnect, never
         # its coverage — after two straight failed reopens the decoder swaps
-        # to the fallback and says so. One-way on purpose: flapping between a
-        # half-alive gateway and the camera is worse than settling on the
-        # camera; a gateway recovery is picked up on the next engine start.
+        # to the fallback and says so.
+        #
+        # The swap used to be one-way ("flapping is worse than settling").
+        # On the pilot server that turned every relay hiccup into a second
+        # RTSP session per camera for the rest of the run: the camera then
+        # served both the gateway and this decoder, its network load doubled,
+        # and cameras that cap their viewers refused the next one (11 Oct
+        # 2026). So a fallen-back decoder now asks the restream again every
+        # `relay_retry_seconds` — off-thread, so a slow open never stalls
+        # this camera's frames — and moves back the moment it answers.
         self.fallback_source = fallback_source
         self.fell_back = False
+        self._relay_source = source
+        self.relay_retry_seconds = relay_retry_seconds
+        self._relay_retry_at = 0.0
+        self._relay_probe: threading.Thread | None = None
+        self._relay_ready: Any = None       # an opened relay capture, handed over
+        self.relay_returns = 0
         self.target_fps = target_fps
         # A view-only camera streams glass and runs NO detection (4 Sep, pilot):
         # the flag rides here so link/ingest status can say so honestly.
@@ -372,6 +386,8 @@ class StreamDecoder:
         orig_index = 0
         attempt = 0
         while not self._stop.is_set():
+            if self.fell_back:
+                cap = self._maybe_return_to_relay(cap)
             stride, self._min_period = self._pacing()
             if self.playout is not None:
                 # Playout pops at content rate; a boosted camera's content
@@ -420,6 +436,7 @@ class StreamDecoder:
                                     "own source", self.camera_id, attempt)
                         self.source = self.fallback_source
                         self.fell_back = True
+                        self._relay_retry_at = time.monotonic() + self.relay_retry_seconds
                         self.playout = (PlayoutBuffer(rate=self.target_fps)
                                         if self._is_live() else None)
                         self._governor = (PushGovernor()
@@ -513,6 +530,62 @@ class StreamDecoder:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        ready, self._relay_ready = self._relay_ready, None
+        if ready is not None:
+            try:
+                ready.release()
+            except Exception:  # noqa: BLE001 - teardown
+                log.debug("[decode %s] relay probe release failed", self.camera_id, exc_info=True)
+
+    # --- back to the relay after a fallback ----------------------------------
+    def _maybe_return_to_relay(self, cap):
+        """Called once per loop while on the fallback source. Swaps to a
+        relay capture the probe handed over, else starts a probe when due."""
+        ready, self._relay_ready = self._relay_ready, None
+        if ready is not None:
+            log.info("[decode %s] restream answering again — back on the gateway",
+                     self.camera_id)
+            try:
+                cap.release()
+            except Exception:  # noqa: BLE001 - the old capture is being discarded
+                log.debug("[decode %s] fallback capture release failed", self.camera_id, exc_info=True)
+            self.source = self._relay_source
+            self.fell_back = False
+            self.relay_returns += 1
+            self.playout = (PlayoutBuffer(rate=self.target_fps)
+                            if self._is_live() else None)
+            self._governor = PushGovernor() if self.playout is not None else None
+            return ready
+        if (self.relay_retry_seconds > 0
+                and time.monotonic() >= self._relay_retry_at
+                and (self._relay_probe is None or not self._relay_probe.is_alive())):
+            self._relay_retry_at = time.monotonic() + self.relay_retry_seconds
+            self._relay_probe = threading.Thread(
+                target=self._probe_relay, name=f"relay-probe:{self.camera_id}",
+                daemon=True)
+            self._relay_probe.start()
+        return cap
+
+    def _probe_relay(self) -> None:
+        """Open the restream and read one frame. Success hands the capture
+        to the decode loop; failure is silent — it will try again later."""
+        from cvti.serving.capture import open_capture
+        probe = None
+        try:
+            probe = open_capture(self._relay_source)
+            opened = getattr(probe, "isOpened", lambda: True)()
+            ok = bool(probe is not None and opened and probe.grab())
+        except Exception:  # noqa: BLE001 - a probe must never take the decoder down
+            log.debug("[decode %s] relay probe failed", self.camera_id, exc_info=True)
+            ok = False
+        if ok and not self._stop.is_set() and self.fell_back:
+            self._relay_ready = probe
+            return
+        if probe is not None:
+            try:
+                probe.release()
+            except Exception:  # noqa: BLE001 - teardown
+                log.debug("[decode %s] probe capture release failed", self.camera_id, exc_info=True)
 
     @property
     def alive(self) -> bool:
