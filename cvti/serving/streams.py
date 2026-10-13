@@ -535,7 +535,7 @@ class StreamDecoder:
             try:
                 ready.release()
             except Exception:  # noqa: BLE001 - teardown
-                pass
+                log.debug("[decode %s] relay probe release failed", self.camera_id, exc_info=True)
 
     # --- back to the relay after a fallback ----------------------------------
     def _maybe_return_to_relay(self, cap):
@@ -548,7 +548,7 @@ class StreamDecoder:
             try:
                 cap.release()
             except Exception:  # noqa: BLE001 - the old capture is being discarded
-                pass
+                log.debug("[decode %s] fallback capture release failed", self.camera_id, exc_info=True)
             self.source = self._relay_source
             self.fell_back = False
             self.relay_returns += 1
@@ -576,6 +576,7 @@ class StreamDecoder:
             opened = getattr(probe, "isOpened", lambda: True)()
             ok = bool(probe is not None and opened and probe.grab())
         except Exception:  # noqa: BLE001 - a probe must never take the decoder down
+            log.debug("[decode %s] relay probe failed", self.camera_id, exc_info=True)
             ok = False
         if ok and not self._stop.is_set() and self.fell_back:
             self._relay_ready = probe
@@ -584,7 +585,7 @@ class StreamDecoder:
             try:
                 probe.release()
             except Exception:  # noqa: BLE001 - teardown
-                pass
+                log.debug("[decode %s] probe capture release failed", self.camera_id, exc_info=True)
 
     @property
     def alive(self) -> bool:
