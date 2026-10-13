@@ -78,31 +78,39 @@ class PlaceholderFirstFrameTests(unittest.TestCase):
 
     def test_the_circle_is_found_on_a_later_frame_and_the_maps_rebuilt(self):
         from cvti.serving import dewarp as dw_mod
-        dw = Dewarp.from_config({"mode": "panorama", "output": [720, 240]})
-        grey = np.full((600, 800, 3), 128, np.uint8)
-        out = dw.apply(grey)
-        self.assertEqual(out.shape, (240, 720, 3))
-        self.assertFalse(dw.describe()["circle_settled"])
-        self.assertEqual(dw.describe()["center"], (400.0, 300.0))   # provisional
-        with mock.patch.object(dw_mod.time, "monotonic", side_effect=[10.0, 10.0, 20.0, 20.0, 30.0, 30.0]):
+        clock = {"t": 100.0}
+        with mock.patch.object(dw_mod.time, "monotonic", side_effect=lambda: clock["t"]):
+            dw = Dewarp.from_config({"mode": "panorama", "output": [720, 240]})
+            grey = np.full((600, 800, 3), 128, np.uint8)
+            out = dw.apply(grey)
+            self.assertEqual(out.shape, (240, 720, 3))
+            self.assertFalse(dw.describe()["circle_settled"])
+            self.assertEqual(dw.describe()["center"], (400.0, 300.0))   # provisional
+            clock["t"] += 0.2
+            dw.apply(fisheye_frame())             # too soon: no retry yet
+            self.assertFalse(dw.describe()["circle_settled"])
+            clock["t"] += 1.0
             dw.apply(grey)                        # still a placeholder: keeps trying
             self.assertFalse(dw.describe()["circle_settled"])
+            clock["t"] += 1.0
             dw.apply(fisheye_frame())             # a real frame: settles and rebuilds
-        self.assertTrue(dw.describe()["circle_settled"])
-        self.assertAlmostEqual(dw.describe()["center"][0], CX, delta=2)
-        self.assertAlmostEqual(dw.describe()["radius"], R, delta=3)
-        # and it stops looking once settled
-        before = dw._circle_attempts
-        dw.apply(fisheye_frame())
-        self.assertEqual(dw._circle_attempts, before)
+            self.assertTrue(dw.describe()["circle_settled"])
+            self.assertAlmostEqual(dw.describe()["center"][0], CX, delta=2)
+            self.assertAlmostEqual(dw.describe()["radius"], R, delta=3)
+            # and it stops looking once settled
+            before = dw._circle_attempts
+            clock["t"] += 5.0
+            dw.apply(fisheye_frame())
+            self.assertEqual(dw._circle_attempts, before)
 
     def test_it_gives_up_after_the_attempt_budget(self):
         from cvti.serving import dewarp as dw_mod
-        dw = Dewarp.from_config({"mode": "panorama", "output": [720, 240]})
         grey = np.full((600, 800, 3), 128, np.uint8)
-        clock = iter(float(t) for t in range(0, 10000, 2))
-        with mock.patch.object(dw_mod.time, "monotonic", side_effect=lambda: next(clock)):
+        clock = {"t": 0.0}
+        with mock.patch.object(dw_mod.time, "monotonic", side_effect=lambda: clock["t"]):
+            dw = Dewarp.from_config({"mode": "panorama", "output": [720, 240]})
             for _ in range(dw_mod.CIRCLE_ATTEMPTS + 5):
+                clock["t"] += 2.0
                 dw.apply(grey)
         self.assertFalse(dw.describe()["circle_settled"])
         self.assertEqual(dw._circle_attempts, dw_mod.CIRCLE_ATTEMPTS)
