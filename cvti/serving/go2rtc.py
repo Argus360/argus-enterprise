@@ -71,6 +71,12 @@ def reap_stale(output_dir: str | Path) -> int:
     one using this output directory's config, so a recycled PID is never
     touched. Returns how many it stopped. Best-effort, never raises."""
     pidfile = Path(output_dir) / PIDFILE
+    # Whatever happens to the process, its advertisement must not outlive
+    # it: a stale stream_gateway.json offers WebRTC on a dead port.
+    try:
+        (Path(output_dir) / "stream_gateway.json").unlink()
+    except OSError:
+        pass
     try:
         pid = int(pidfile.read_text().strip())
     except (OSError, ValueError):

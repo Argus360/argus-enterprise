@@ -12,6 +12,19 @@ import { Empty, Spinner } from "./common";
 
 const RETRY_OFFLINE_MS = 5_000;
 const FIRST_FRAME_TIMEOUT_MS = 35_000;
+// ICE recovers from "disconnected" on its own more often than not; only a
+// disconnect that lasts this long is treated as a dead peer.
+const WEBRTC_DISCONNECT_GRACE_MS = 4_000;
+// A peer can stay "connected" while the relay stops sending (the camera
+// dropped behind go2rtc). Decoded frames are counted this often, and this
+// many idle checks in a row mean the track is dead.
+const STALL_CHECK_MS = 5_000;
+const STALL_CHECKS = 2;
+
+function healthOffline(state: string | undefined): boolean {
+  const health = String(state || "").toLowerCase();
+  return health === "offline" || health === "failed" || health === "error";
+}
 
 type PlayerState =
   | { kind: "loading" }
@@ -41,6 +54,9 @@ export default function CameraStream({
   const [evidence, setEvidence] = useState<MediaEvidence>("none");
   const [retry, setRetry] = useState(0);
   const [notice, setNotice] = useState<ConcealmentNotice | null>(null);
+  // Read by the stall watchdog without restarting it on every health event.
+  const cameraState = useRef(camera.state);
+  cameraState.current = camera.state;
 
   useEffect(() => {
     setNotice(null);
@@ -138,6 +154,64 @@ export default function CameraStream({
     return () => { cancelled = true; clearInterval(timer); };
   }, [active, api, camera.id, tracking, state]);
 
+  // The tile owns its reconnect (W1 wall). A WebRTC peer that failed or
+  // closed used to sit on its last frame for good: nothing listened to the
+  // peer after the answer, and the descriptor poll above saw the same URL
+  // and did nothing (CHI, 11 Oct 2026). Resolve again: at once on
+  // "failed"/"closed", after a short grace on "disconnected".
+  useEffect(() => {
+    if (!active || state.kind !== "webrtc") return;
+    const peer = state.peer;
+    if (typeof peer.addEventListener !== "function") return;
+    let grace: ReturnType<typeof setTimeout> | undefined;
+    const reconnect = () => {
+      grace = undefined;
+      setEvidence("none");
+      setRetry((n) => n + 1);
+    };
+    const onChange = () => {
+      const now = peer.connectionState;
+      if (now === "failed" || now === "closed") reconnect();
+      else if (now === "disconnected")
+        grace = grace ?? setTimeout(reconnect, WEBRTC_DISCONNECT_GRACE_MS);
+      else if (grace) {
+        clearTimeout(grace);
+        grace = undefined;
+      }
+    };
+    peer.addEventListener("connectionstatechange", onChange);
+    return () => {
+      if (grace) clearTimeout(grace);
+      peer.removeEventListener("connectionstatechange", onChange);
+    };
+  }, [active, state]);
+
+  // ...and a connected peer whose track went quiet. While health says the
+  // camera itself is fine, no new decoded frame for STALL_CHECKS checks means
+  // the relay dropped this stream: resolve again instead of showing a still.
+  useEffect(() => {
+    if (!active || state.kind !== "webrtc" || evidence !== "webrtc-track") return;
+    const element = video.current;
+    if (!element || typeof element.getVideoPlaybackQuality !== "function") return;
+    let last = element.getVideoPlaybackQuality().totalVideoFrames;
+    let idle = 0;
+    const timer = setInterval(() => {
+      const frames = element.getVideoPlaybackQuality().totalVideoFrames;
+      if (frames !== last) {
+        last = frames;
+        idle = 0;
+        return;
+      }
+      idle += 1;
+      if (idle >= STALL_CHECKS && !healthOffline(cameraState.current)) {
+        idle = 0;
+        setEvidence("none");
+        setRetry((n) => n + 1);
+      }
+    }, STALL_CHECK_MS);
+    return () => clearInterval(timer);
+  }, [active, state, evidence]);
+
   // A tile resolved its stream once and then sat on the result. Open the wall
   // before pressing Start monitoring and every tile stayed "offline" until
   // something remounted it — and each engine run publishes on a new port, so
@@ -194,6 +268,12 @@ export default function CameraStream({
           Camera health reports that this feed is reconnecting.
         </Empty>
       ) : null}
+      {presentation.phase === "degraded" && evidence !== "none" &&
+        healthOffline(camera.state) && (
+        <div className="media-banner" role="status">
+          Camera offline. Showing the last image received.
+        </div>
+      )}
       <div className="media-label">
         <span
           className={`status-dot ${

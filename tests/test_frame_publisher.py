@@ -567,6 +567,47 @@ class UiStreamWiringTests(unittest.TestCase):
                       "engine thread) open forever")
 
 
+class PerCameraPortTests(unittest.TestCase):
+    """W1 wall: a browser allows six connections per host:port and every
+    MJPEG tile holds one. Each camera the engine names gets a port of its
+    own; the shared port still serves everything."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.pub = FramePublisher(draw_boxes=False).start(self.d, cameras=["cam1", "cam2"])
+        self.frame = np.full((48, 64, 3), 60, np.uint8)
+
+    def tearDown(self):
+        self.pub.stop()
+
+    def _get(self, port, path):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                     headers={"X-Argus-Token": self.pub.token})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return r.read()
+
+    def test_every_named_camera_gets_a_distinct_port(self):
+        ports = self.pub.camera_ports
+        self.assertEqual(set(ports), {"cam1", "cam2"})
+        self.assertEqual(len({self.pub.port, *ports.values()}), 3)
+        self.assertEqual(self.pub.port_for("cam1"), ports["cam1"])
+        self.assertEqual(self.pub.port_for("unknown"), self.pub.port)
+
+    def test_frames_json_carries_the_map_and_every_port_serves_frames(self):
+        info = json.loads((self.d / "frames.json").read_text(encoding="utf-8"))
+        self.assertEqual(info["ports"], self.pub.camera_ports)
+        self.pub.publish("cam1", self.frame)
+        self.assertEqual(self._get(info["ports"]["cam1"], "/frame/cam1")[:2], JPEG_MAGIC)
+        self.assertEqual(self._get(info["port"], "/frame/cam1")[:2], JPEG_MAGIC)
+
+    def test_stop_closes_the_extra_ports(self):
+        port = self.pub.camera_ports["cam1"]
+        self.pub.stop()
+        self.assertEqual(self.pub.camera_ports, {})
+        with self.assertRaises(OSError):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/cameras", timeout=1)
+
+
 class MarkerLifecycleTests(unittest.TestCase):
     def test_stop_removes_frames_json(self):
         # The file existing IS the publisher being alive (the contract

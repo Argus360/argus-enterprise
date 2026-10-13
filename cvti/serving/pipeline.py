@@ -1373,7 +1373,9 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
     from cvti.serving.frame_publisher import FramePublisher
     # Raw Watch tiles stay pure glass. Tracking viewers explicitly select the
     # separately cached annotated variant; they never alter the canonical JPEG.
-    publisher = FramePublisher().start(output_dir) if publish_frames else None
+    publisher = (FramePublisher().start(
+        output_dir, cameras=[str(c.get("id")) for c in site.get("cameras") or []])
+        if publish_frames else None)
 
     def _on_link_change(cam_id: str, previous: str, state: str, held: float) -> None:
         """A camera going offline raises its own alert through normal routing.

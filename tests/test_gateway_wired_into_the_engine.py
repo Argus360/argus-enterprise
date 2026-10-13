@@ -200,15 +200,69 @@ class DecoderFallbackTests(unittest.TestCase):
         self.assertFalse(d.fell_back)
         self.assertEqual({c for c in calls}, {"rtsp://127.0.0.1:8554/cam"})
 
-    def test_the_swap_is_one_way(self):
-        """Flapping between a half-alive gateway and the camera is worse than
-        settling on the camera. Once direct, stay direct until restart."""
-        d, calls = self._run_decoder(
-            [False, False, True],
-            fallback_source="rtsp://cam7/main")
+    def test_the_decoder_returns_to_the_restream_once_it_answers(self):
+        """The swap used to be one-way. On the pilot server every relay
+        hiccup then left a second RTSP session on the camera for the rest of
+        the run (11 Oct 2026). A fallen-back decoder probes the restream
+        every relay_retry_seconds and moves back when it answers."""
+        from cvti.serving import streams as st
+
+        class DeadCap:
+            def get(self, *_a): return 15.0
+            def grab(self): return False
+            def read(self): return False, None
+            def release(self): pass
+            def set(self, *_a): pass
+            def isOpened(self): return False   # noqa: N802 - cv2 API
+
+        class LiveCap(DeadCap):
+            def grab(self): return True
+            def isOpened(self): return True    # noqa: N802 - cv2 API
+            def read(self):
+                import numpy as np
+                return True, np.zeros((8, 8, 3), dtype=np.uint8)
+
+        relay = "rtsp://127.0.0.1:8554/cam"
+        relay_answers = {"up": False}
+        calls = []
+        def fake_open(source, **_kw):
+            calls.append(str(source))
+            if str(source) == relay:
+                return LiveCap() if relay_answers["up"] else DeadCap()
+            return LiveCap()                   # the camera itself is fine
+
+        d = st.StreamDecoder("cam", relay, target_fps=30.0, reconnect_backoff=0.01,
+                             offline_grace_seconds=0.05,
+                             fallback_source="rtsp://cam7/main",
+                             relay_retry_seconds=0.05)
+        with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
+            d.start()
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not d.fell_back:
+                time.sleep(0.02)
+            self.assertTrue(d.fell_back, "never fell back to the camera")
+            self.assertEqual(d.source, "rtsp://cam7/main")
+            relay_answers["up"] = True        # gateway restarted
+            while time.time() < deadline and d.fell_back:
+                time.sleep(0.02)
+            d.stop()
+        self.assertFalse(d.fell_back, "stayed on the camera after the relay came back")
+        self.assertEqual(d.source, relay)
+        self.assertEqual(d.relay_returns, 1)
+        self.assertFalse(d.link_status()["gateway_fallback"])
+        # Frames kept flowing throughout: the probe never stalled the loop.
+        self.assertIsNotNone(d.read_latest())
+
+    def test_a_probe_that_fails_leaves_the_camera_on_its_own_url(self):
+        from cvti.serving import streams as st
+        d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam",
+                             fallback_source="rtsp://cam7/main", relay_retry_seconds=0.01)
+        d.fell_back, d.source = True, "rtsp://cam7/main"
+        with mock.patch("cvti.serving.capture.open_capture",
+                        side_effect=RuntimeError("refused")):
+            d._probe_relay()
+        self.assertIsNone(d._relay_ready)
         self.assertTrue(d.fell_back)
-        self.assertNotIn("rtsp://127.0.0.1:8554/cam",
-                         calls[calls.index("rtsp://cam7/main"):])
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +299,19 @@ class StreamDescriptorTests(unittest.TestCase):
                              "http://127.0.0.1:1984/api/webrtc?src=front_door")
             self.assertIn("ws://127.0.0.1:1984/api/ws?src=front_door", got["ws"])
             self.assertIn("token=tk", got["mjpeg_fallback"])
+
+    def test_each_camera_streams_from_its_own_port_when_the_publisher_made_one(self):
+        """W1 wall: twelve MJPEG tiles on one origin queue behind the
+        browser's six-per-host cap. A camera with a port of its own uses it;
+        one without keeps the shared port."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "frames.json").write_text(json.dumps(
+                {"port": 7777, "token": "tk", "ports": {"Front Door": 7801}}))
+            c = self._client(tmp)
+            front = c.get("/api/v1/cameras/Front Door/stream").json()
+            other = c.get("/api/v1/cameras/Yard/stream").json()
+            self.assertTrue(front["url"].startswith("http://127.0.0.1:7801/stream/"))
+            self.assertTrue(other["url"].startswith("http://127.0.0.1:7777/stream/"))
 
     def test_a_camera_the_gateway_does_not_carry_stays_mjpeg(self):
         with tempfile.TemporaryDirectory() as tmp:
