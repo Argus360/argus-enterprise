@@ -28,8 +28,9 @@ from cvti.serving.go2rtc import Go2rtcGateway, _sanitize, restreamable  # noqa: 
 CAMS = [
     {"id": "Main Corridor", "source": "rtsp://user:pw@10.0.0.7/stream1"},
     {"id": "Loading Bay", "source": "data/test_clips/empty_warehouse.mp4"},
-    {"id": "Front Door", "source": "https://cdn.example/live.m3u8"},
+    {"id": "Front Door", "source": "rtsp://user:pw@10.0.0.8/stream1"},
     {"id": "Reception", "source": 0},
+    {"id": "Public Feed", "source": "https://cdn.example/live.m3u8"},
 ]
 
 
@@ -40,9 +41,19 @@ class StreamSelectionTests(unittest.TestCase):
         gw = Go2rtcGateway(CAMS, tempfile.mkdtemp())
         self.assertEqual(set(gw.streams), {"Main Corridor", "Front Door"})
         self.assertTrue(restreamable("rtsp://cam/1"))
+        self.assertTrue(restreamable("RTSPS://cam/1"))
         self.assertFalse(restreamable("clip.mp4"))
         self.assertFalse(restreamable(0))
         self.assertFalse(restreamable("0"))
+
+    def test_http_sources_decode_direct_and_are_never_transcoded(self):
+        """go2rtc cannot pass HLS/MJPEG through: it spawned ffmpeg and
+        transcoded to H.264 for the engine's restream, 44% CPU for one
+        public feed on a laptop (13 Oct 2026). The engine decodes those."""
+        self.assertFalse(restreamable("https://cdn.example/live.m3u8"))
+        self.assertFalse(restreamable("http://10.0.0.9/mjpeg"))
+        gw = Go2rtcGateway(CAMS, tempfile.mkdtemp())
+        self.assertNotIn("Public Feed", gw.streams)
 
     def test_stream_names_are_url_safe(self):
         """Camera ids are display names ('Main Corridor') — hostile inside an
@@ -79,7 +90,7 @@ class ConfigTests(unittest.TestCase):
         streams = gw.build_config()["streams"]
         self.assertEqual(streams, {
             "main_corridor": "rtsp://user:pw@10.0.0.7/stream1",
-            "front_door": "https://cdn.example/live.m3u8",
+            "front_door": "rtsp://user:pw@10.0.0.8/stream1",
         })
 
     def test_write_config_is_valid_yaml_on_disk(self):

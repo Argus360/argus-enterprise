@@ -131,11 +131,17 @@ def _sanitize(camera_id: str, taken: set) -> str:
 
 
 def restreamable(source: Any) -> bool:
-    """Only network cameras go through the gateway. Files and webcams are
-    local — no session cap to consolidate, no transport to fix — and looping
-    a demo clip is the decoder's existing job, not go2rtc's."""
+    """Only RTSP cameras go through the gateway. Files and webcams are local
+    — no session cap to consolidate, no transport to fix — and looping a demo
+    clip is the decoder's existing job, not go2rtc's. HTTP(S) sources (HLS,
+    MJPEG, a public feed) stay on the direct decode path too: go2rtc cannot
+    pass those through, so it spawned ffmpeg and TRANSCODED them to H.264 to
+    serve the engine an RTSP restream — one stream cost a laptop 44% CPU in
+    the relay plus the engine's own decode (13 Oct 2026). The engine decodes
+    HTTP sources itself; the wall shows them over MJPEG as before."""
     from cvti.serving.capture import is_live_source
-    return is_live_source(source)
+    s = str(source).lower()
+    return is_live_source(source) and (s.startswith("rtsp://") or s.startswith("rtsps://"))
 
 
 def _free_port() -> int:
