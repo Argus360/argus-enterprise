@@ -4,6 +4,24 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.2 — 13 Oct 2026
+
+**Groq works as a verifier.** Groq accepts at most three images per
+request, and Argus was sending four to six, so every verdict there was
+refused. Each cloud provider now carries its image limit, and the engine
+keeps the subject frame plus two evenly spaced earlier frames when the
+provider needs it. Groq's default model is qwen/qwen3.8-27b, the one that
+reads images. A site that sets its own `gate_max_frames` keeps it. Note the
+Groq free tier allows about one verdict a minute and under thirty a day with
+images; it is for a test, not a week of alerts.
+
+**Previews are given time to start, and stop fighting each other,** by
+Demi. A tile now waits 30 seconds for the first image instead of giving up on
+a slow camera, and each camera's preview uses its own localhost origin, so a
+dozen tiles no longer queue behind the browser's six-connections-per-host
+limit on the preview path. Support bundles gain stream acquisition counts and
+read, resize and encode timings.
+
 ## v1.10.1 — 12 Oct 2026
 
 Preview fixes from the pilot server's own diagnostics, by Demi.
