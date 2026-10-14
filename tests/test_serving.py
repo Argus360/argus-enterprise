@@ -779,3 +779,26 @@ class SmoothPublishTest(unittest.TestCase):
         import inspect
         from cvti.serving.streams import StreamDecoder
         self.assertIn("stale_dropped", inspect.getsource(StreamDecoder.link_status))
+
+
+class WallFpsCpuCapTests(unittest.TestCase):
+    """Twelve watched tiles at 24 fps decoded 288 frames a second of 5-megapixel
+    HEVC on the five-vCPU pilot server, for display alone (13 Oct 2026)."""
+
+    def test_a_cpu_box_shares_a_decode_budget_across_cameras(self):
+        from cvti.serving.pipeline import wall_fps_for
+        self.assertEqual(wall_fps_for({}, 24.0, 12, "cpu"), 8.0)     # 96 // 12 = 8
+        self.assertEqual(wall_fps_for({}, 24.0, 4, "cpu"), 24.0)     # 96 // 4 = 24: no cap
+        self.assertEqual(wall_fps_for({}, 24.0, 6, "cpu"), 16.0)
+        self.assertEqual(wall_fps_for({}, 24.0, 40, "cpu"), 8.0)     # floor
+
+    def test_a_gpu_box_and_an_explicit_site_value_are_left_alone(self):
+        from cvti.serving.pipeline import wall_fps_for
+        self.assertEqual(wall_fps_for({}, 24.0, 12, "cuda"), 24.0)
+        self.assertEqual(wall_fps_for({"wall_fps": 12}, 24.0, 12, "cpu"), 12.0)
+        self.assertEqual(wall_fps_for({"wall_fps": 30}, 24.0, 12, "cpu"), 30.0)
+
+    def test_run_site_applies_it_before_building_the_pipeline(self):
+        import inspect
+        from cvti.serving import pipeline
+        self.assertIn("publish_fps = wall_fps_for(site, publish_fps, len(sources)", inspect.getsource(pipeline.run_site))
