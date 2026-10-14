@@ -4,6 +4,15 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.9 — 14 Oct 2026
+
+**A computer with a graphics card is treated as one.** The installed app
+detects on the graphics card through DirectML, but the savings added this
+week for computers without one (keyframe-only decoding, the shared wall
+rate, the detector thread limit) looked only at the wrong signal and would
+have applied to a graphics-card box too. They now apply only when there is
+no graphics card to detect on. Install this one on the GPU box.
+
 ## v1.10.8 — 14 Oct 2026
 
 **Fisheye cameras now get the keyframe treatment too.** v1.10.7 judged a
