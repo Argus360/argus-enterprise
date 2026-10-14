@@ -113,7 +113,162 @@ def rtsp_alive(source: Any, timeout: float = 4.0) -> bool:
         return False
 
 
-def open_capture(source: Any, *, low_latency: bool = True):
+def ffmpeg_exe() -> "str | None":
+    """The static ffmpeg the imageio-ffmpeg wheel ships (bundled in every
+    build for evidence clips), else one on PATH, else None."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001 - optional dependency
+        log.debug("imageio-ffmpeg unavailable; looking for ffmpeg on PATH", exc_info=True)
+    import shutil
+    return shutil.which("ffmpeg")
+
+
+# cv2.CAP_PROP_* values the keyframe capture answers, without importing cv2 here.
+_PROP_FRAME_WIDTH, _PROP_FRAME_HEIGHT, _PROP_FPS = 3, 4, 5
+
+
+class FFmpegKeyframeCapture:
+    """A VideoCapture look-alike that decodes ONLY keyframes.
+
+    OpenCV must decode every frame of a stream to hand over one, and on the
+    pilot server seven 5-megapixel HEVC cameras decoded in full ate the whole
+    box before detection saw a frame (13 Oct 2026). FFmpeg can skip
+    everything but keyframes before decoding (`-skip_frame nokey`), one
+    frame every GOP, typically one or two seconds, at a small fraction of
+    the cost. OpenCV cannot pass that option through its capture options
+    (measured: same frame count), so this runs ffmpeg itself and reads raw
+    BGR frames from its stdout. Same methods the decoder uses on cv2:
+    isOpened, grab, read, get, set, release. get(FPS) is 0: the decoder then
+    paces by wall clock, which is right for frames that arrive per GOP.
+    """
+    keyframes_only = True
+
+    def __init__(self, source: Any, *, binary: str, open_timeout_s: float = 15.0,
+                 io_timeout_s: float = 10.0) -> None:
+        import re
+        import subprocess
+        import threading
+        self.source = str(source)
+        self.width = 0
+        self.height = 0
+        self.codec = ""
+        self._frame_bytes = 0
+        self._proc = None
+        self._stderr_tail: list = []
+        self._size_ready = threading.Event()
+        cmd = [binary, "-hide_banner", "-nostdin", "-loglevel", "info"]
+        if self.source.lower().startswith("rtsp"):
+            cmd += ["-rtsp_transport", "tcp", "-timeout", str(int(io_timeout_s * 1_000_000))]
+        cmd += ["-skip_frame", "nokey", "-i", self.source, "-an", "-sn",
+                "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+        flags = {}
+        if sys.platform == "win32":
+            flags["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, bufsize=0, **flags)
+        except OSError as exc:
+            log.warning("[keyframes] could not start ffmpeg: %s", exc)
+            return
+        pattern = re.compile(r"Video: (\w+).*?,\s*(\d{2,5})x(\d{2,5})")
+
+        def pump() -> None:
+            # Keep stderr drained (ffmpeg blocks when it fills) and learn the
+            # stream's size from its "Stream #0:0: Video: ..." line.
+            try:
+                for raw in iter(self._proc.stderr.readline, b""):
+                    line = raw.decode("utf-8", "replace").rstrip()
+                    self._stderr_tail = (self._stderr_tail + [line])[-8:]
+                    if not self._size_ready.is_set():
+                        m = pattern.search(line)
+                        if m:
+                            self.codec = m.group(1)
+                            self.width, self.height = int(m.group(2)), int(m.group(3))
+                            self._frame_bytes = self.width * self.height * 3
+                            self._size_ready.set()
+            except (OSError, ValueError):
+                pass
+            finally:
+                self._size_ready.set()
+
+        threading.Thread(target=pump, name="ffmpeg-stderr", daemon=True).start()
+        if not self._size_ready.wait(open_timeout_s) or not self._frame_bytes:
+            log.warning("[keyframes] %s: no video stream within %.0fs (%s)",
+                        _redact(self.source), open_timeout_s, " | ".join(self._stderr_tail[-2:]))
+            self.release()
+
+    def isOpened(self) -> bool:  # noqa: N802 - cv2 API
+        return self._proc is not None and self._frame_bytes > 0 and self._proc.poll() is None
+
+    def _read_frame(self):
+        if not self.isOpened():
+            return None
+        buf = bytearray()
+        want = self._frame_bytes
+        try:
+            while len(buf) < want:
+                chunk = self._proc.stdout.read(want - len(buf))
+                if not chunk:
+                    return None
+                buf += chunk
+        except (OSError, ValueError):
+            return None
+        return bytes(buf)
+
+    def grab(self) -> bool:
+        self._last = self._read_frame()
+        return self._last is not None
+
+    def read(self):
+        data = self._read_frame()
+        if data is None:
+            return False, None
+        import numpy as np
+        frame = np.frombuffer(data, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return True, frame.copy()
+
+    def get(self, prop: int) -> float:
+        if prop == _PROP_FRAME_WIDTH:
+            return float(self.width)
+        if prop == _PROP_FRAME_HEIGHT:
+            return float(self.height)
+        return 0.0                       # FPS unknown: one frame per GOP
+
+    def set(self, *_args) -> bool:
+        return False
+
+    def interrupt(self) -> None:
+        """Unblock a read from another thread (the decoder's stop())."""
+        self.release()
+
+    def release(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:  # noqa: BLE001 - then kill
+                    proc.kill()
+        except OSError:
+            log.debug("[keyframes] terminate failed", exc_info=True)
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _redact(url: str) -> str:
+    import re
+    return re.sub(r"://[^@/]*@", "://***@", url)
+
+
+def open_capture(source: Any, *, low_latency: bool = True, keyframes_only: bool = False):
     """Open `source` with the right backend and the least buffering.
 
     `low_latency=False` for offline work (evaluation over files) where every
@@ -123,6 +278,16 @@ def open_capture(source: Any, *, low_latency: bool = True):
 
     global _HW_DECODE_FAILED
     src = int(source) if str(source).isdigit() else source
+    if keyframes_only and not isinstance(src, int):
+        binary = ffmpeg_exe()
+        if binary:
+            cap = FFmpegKeyframeCapture(src, binary=binary)
+            if cap.isOpened():
+                return cap
+            log.warning("[keyframes] ffmpeg keyframe capture failed for %s; decoding in full",
+                        _redact(str(src)))
+        else:
+            log.warning("[keyframes] no ffmpeg available; decoding %s in full", _redact(str(src)))
     hw = [] if _HW_DECODE_FAILED else _hw_decode_params(cv2)
     live_params = _live_decode_params(cv2) if low_latency else []
 

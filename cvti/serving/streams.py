@@ -158,9 +158,20 @@ class StreamDecoder:
                  relay_retry_seconds: float = 60.0,
                  dewarp: Any = None,
                  idle_when_unwatched: bool = False,
-                 probe_source: int | str | None = None) -> None:
+                 probe_source: int | str | None = None,
+                 keyframes_only_min_width: int = 0) -> None:
         self.camera_id = camera_id
         self.source = source
+        # Keyframe-only decode (capture.FFmpegKeyframeCapture) for a live
+        # stream at least this wide; 0 = never. The first open is a normal
+        # one, which tells us the width; a stream that qualifies is reopened
+        # keyframes-only on the next loop. One frame per GOP, about one a
+        # second, at a fraction of the decode cost: the seven 5-megapixel
+        # HEVC cameras on the pilot server (13 Oct 2026). Falls back to full
+        # decode by itself when the camera is moved to a smaller substream.
+        self.keyframes_only_min_width = int(keyframes_only_min_width or 0)
+        self._cap_keyframes = False
+        self._cap: Any = None
         # A view-only camera nobody is watching decodes NOTHING. Its link
         # state comes from a cheap RTSP handshake every idle_probe_seconds
         # against the camera's own URL (probe_source), and the capture is
@@ -379,6 +390,7 @@ class StreamDecoder:
     def link_status(self) -> dict:
         return {"camera_id": self.camera_id, "state": self.state,
                 "idle": self.idle,
+                "decode": "keyframes" if self._cap_keyframes else "full",
                 "time_in_state": round(self.time_in_state, 1),
                 "reconnects": self.reconnects,
                 "last_frame_at": self.last_frame_at,
@@ -423,11 +435,22 @@ class StreamDecoder:
         self._thread.start()
         return self
 
+    def _wants_keyframes(self) -> bool:
+        return (self.keyframes_only_min_width > 0 and self._is_live()
+                and self.stream_width >= self.keyframes_only_min_width)
+
     def _open(self):
         # One capture path for every platform (cvti/serving/capture.py): the
         # right backend, low-latency flags, and a one-frame buffer request.
         from cvti.serving.capture import open_capture
-        return open_capture(self.source)
+        want = self._wants_keyframes()
+        cap = open_capture(self.source, keyframes_only=want)
+        self._cap_keyframes = bool(getattr(cap, "keyframes_only", False))
+        self._cap = cap
+        if want and not self._cap_keyframes:
+            # No ffmpeg or it refused: do not ask again for this stream.
+            self.keyframes_only_min_width = 0
+        return cap
 
     def _loop(self) -> None:
         import cv2
@@ -456,6 +479,20 @@ class StreamDecoder:
                     return
                 cap = self._open()
                 self._fps = cap.get(cv2.CAP_PROP_FPS) or self._fps
+                attempt = 0
+                continue
+            if self._wants_keyframes() != self._cap_keyframes:
+                # The stream turned out big enough for keyframe-only decode
+                # (or was moved to a small substream): reopen the right way.
+                log.info("[decode %s] %dx%d stream: switching to %s decode", self.camera_id,
+                         self.stream_width, self.stream_height,
+                         "keyframe-only" if self._wants_keyframes() else "full")
+                try:
+                    cap.release()
+                except Exception:  # noqa: BLE001 - the capture is being discarded
+                    log.debug("[decode %s] release before reopen failed", self.camera_id, exc_info=True)
+                cap = self._open()
+                self._fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
                 attempt = 0
                 continue
             if self.fell_back:
@@ -606,6 +643,12 @@ class StreamDecoder:
 
     def stop(self) -> None:
         self._stop.set()
+        cap = getattr(self, "_cap", None)
+        if cap is not None and hasattr(cap, "interrupt"):
+            try:
+                cap.interrupt()          # a keyframe capture may be mid-read on its pipe
+            except Exception:  # noqa: BLE001 - teardown
+                log.debug("[decode %s] interrupt failed", self.camera_id, exc_info=True)
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         ready, self._relay_ready = self._relay_ready, None
