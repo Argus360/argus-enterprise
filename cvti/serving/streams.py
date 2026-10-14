@@ -172,6 +172,12 @@ class StreamDecoder:
         self.keyframes_only_min_width = int(keyframes_only_min_width or 0)
         self._cap_keyframes = False
         self._cap: Any = None
+        # The size the camera SENDS, before any dewarp. stream_width is what
+        # consumers see (dewarped); this is what decoding costs. The three
+        # ceiling fisheyes on the pilot server were judged by their 1600 px
+        # panorama and never switched to keyframe decode (14 Oct 2026).
+        self.source_width = 0
+        self.source_height = 0
         # A view-only camera nobody is watching decodes NOTHING. Its link
         # state comes from a cheap RTSP handshake every idle_probe_seconds
         # against the camera's own URL (probe_source), and the capture is
@@ -327,6 +333,8 @@ class StreamDecoder:
     def ingest_status(self) -> dict:
         out = {
             "width": self.stream_width, "height": self.stream_height,
+            "source_width": getattr(self, "source_width", 0),      # tests build decoders raw
+            "source_height": getattr(self, "source_height", 0),
             "source_fps": round(self._fps, 1),
             "busy_ms_per_frame": round(self._busy_ms or 0.0, 1),
             "sustainable_fps": round(self.sustainable_fps, 1),
@@ -437,7 +445,7 @@ class StreamDecoder:
 
     def _wants_keyframes(self) -> bool:
         return (self.keyframes_only_min_width > 0 and self._is_live()
-                and self.stream_width >= self.keyframes_only_min_width)
+                and self.source_width >= self.keyframes_only_min_width)
 
     def _open(self):
         # One capture path for every platform (cvti/serving/capture.py): the
@@ -485,7 +493,7 @@ class StreamDecoder:
                 # The stream turned out big enough for keyframe-only decode
                 # (or was moved to a small substream): reopen the right way.
                 log.info("[decode %s] %dx%d stream: switching to %s decode", self.camera_id,
-                         self.stream_width, self.stream_height,
+                         self.source_width, self.source_height,
                          "keyframe-only" if self._wants_keyframes() else "full")
                 try:
                     cap.release()
@@ -512,6 +520,8 @@ class StreamDecoder:
             if ok:
                 ok, image = cap.read()
                 orig_index += 1
+            if ok and not self.source_width:
+                self.source_height, self.source_width = image.shape[:2]
             if ok and self.dewarp is not None:
                 try:
                     image = self.dewarp.apply(image)

@@ -447,7 +447,11 @@ class MultiStreamPipeline:
                  synchronized_box_cameras: set[str] | None = None,
                  camera_dewarp: dict | None = None,
                  keyframe_decode: bool | None = None,
-                 keyframe_min_width: int = 2000) -> None:
+                 keyframe_min_width: int = 2000,
+                 detector_threads: int | None = None) -> None:
+        # Threads for the CPU detector session (cvti.detector.accel). None =
+        # detector_threads_for(): one core kept free on a CPU-only box.
+        self.detector_threads = detector_threads
         self.synchronized_box_cameras = set(synchronized_box_cameras or ())
         # Keyframe-only decode for big live streams: None = on for CPU-only
         # boxes, off with a GPU. A site can force it either way.
@@ -537,7 +541,10 @@ class MultiStreamPipeline:
         # the provider this box offers when torch would be CPU-bound, torch
         # exactly as before everywhere else. detector_info says which and why;
         # health carries it.
+        from cvti.detector import accel
         from cvti.detector.accel import load_detector
+        accel.DETECTOR_THREADS = (self.detector_threads if self.detector_threads is not None
+                                  else accel.detector_threads_for(None, self.device))
         self._model, self.detector_info = load_detector(
             self.weights, backend=self.detector_backend, device=self.device)
         self._camera_inference.load(self._model)
@@ -1498,7 +1505,11 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                camera_dewarp=_dewarps_for(site.get("cameras", [])),
                                keyframe_decode=(bool(site["keyframe_decode"])
                                                 if isinstance(site.get("keyframe_decode"), bool) else None),
-                               keyframe_min_width=int(site.get("keyframe_min_width", 2000) or 2000))
+                               keyframe_min_width=int(site.get("keyframe_min_width", 2000) or 2000),
+                               detector_threads=(int(site["detector_threads"])
+                                                 if isinstance(site.get("detector_threads"), int)
+                                                 and not isinstance(site.get("detector_threads"), bool)
+                                                 and site["detector_threads"] > 0 else None))
 
     def _fast_path(alert) -> None:
         """Two-tier alerting (EP-06-T4): criticals are shown provisionally the
