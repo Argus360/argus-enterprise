@@ -48,7 +48,13 @@ def _frame_overlays(state: Any, timestamp: float | None = None, *,
     now = time.monotonic() if timestamp is None else timestamp
     # Smooth publication must not paint seconds-old coordinates onto live video.
     # Exact-frame publication deliberately displays the inference frame itself.
-    if not exact_frame and observed_at is not None and now - observed_at > 1.0:
+    # "Seconds-old" is relative to how often this camera is detected on: a
+    # fixed one-second limit on a box that is refreshed every 4.7 s (CHI,
+    # 13 Oct 2026) meant boxes expired before they were ever drawn, and
+    # "person detection is not working" was the wall hiding working
+    # detections. The limit is twice the camera's measured detection interval,
+    # never under a second, never over ten.
+    if not exact_frame and observed_at is not None and now - observed_at > _overlay_max_age(state):
         records = []
     object_overlay_provider = getattr(state, "general_object_overlays", None)
     if object_overlay_provider is not None:
@@ -68,6 +74,16 @@ def _frame_overlays(state: Any, timestamp: float | None = None, *,
         )
         for item in records
     ]
+
+
+OVERLAY_MIN_AGE_S = 1.0
+OVERLAY_MAX_AGE_S = 10.0
+
+
+def _overlay_max_age(state: Any) -> float:
+    """How long the last detection's boxes stay on the wall for this camera."""
+    interval = float(getattr(state, "_detection_interval_s", 0.0) or 0.0)
+    return max(OVERLAY_MIN_AGE_S, min(OVERLAY_MAX_AGE_S, 2.0 * interval))
 
 
 def _object_track_snapshot(state: Any, timestamp: float | None = None) -> dict | None:
@@ -790,6 +806,13 @@ class MultiStreamPipeline:
         # Invalidate the previous coordinates before processing. The timestamp
         # is inference admission time, not completion of a slow model call.
         state._motion_overlays = []
+        previous = getattr(state, "_motion_overlay_observed_at", None)
+        if previous is not None and tracker_timestamp > previous:
+            # Smoothed interval between this camera's detections; the wall's
+            # box lifetime follows it (see _overlay_max_age).
+            last = float(getattr(state, "_detection_interval_s", 0.0) or 0.0)
+            gap = tracker_timestamp - previous
+            state._detection_interval_s = gap if not last else 0.5 * last + 0.5 * gap
         state._motion_overlay_observed_at = tracker_timestamp
         # `process` guards its detector section, but everything around it —
         # tracking, zones, rule evaluation, evidence selection — was unguarded,
