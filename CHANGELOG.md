@@ -4,6 +4,18 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.8 — 14 Oct 2026
+
+**Fisheye cameras now get the keyframe treatment too.** v1.10.7 judged a
+camera's size after the fisheye correction had shrunk it, so the three
+ceiling cameras on the pilot server kept decoding in full. The size the
+camera sends is what counts now.
+
+**The detector leaves a core for everything else.** On a computer without
+a graphics card the detector used every processor core and the camera wall,
+the video relay and the alert verifier waited behind it. It now keeps one
+core free. `detector_threads` in the site file overrides this.
+
 ## v1.10.7 — 14 Oct 2026
 
 Two changes for a server with no graphics card and many large cameras.
