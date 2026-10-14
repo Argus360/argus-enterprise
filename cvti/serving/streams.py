@@ -156,9 +156,23 @@ class StreamDecoder:
                  on_state_change=None, view_only: bool = False,
                  fallback_source: int | str | None = None,
                  relay_retry_seconds: float = 60.0,
-                 dewarp: Any = None) -> None:
+                 dewarp: Any = None,
+                 idle_when_unwatched: bool = False,
+                 probe_source: int | str | None = None) -> None:
         self.camera_id = camera_id
         self.source = source
+        # A view-only camera nobody is watching decodes NOTHING. Its link
+        # state comes from a cheap RTSP handshake every idle_probe_seconds
+        # against the camera's own URL (probe_source), and the capture is
+        # opened the moment a viewer appears (display_fps > 0) and released
+        # again when the last one leaves. On the pilot server eight view-only
+        # cameras, seven of them 5-megapixel HEVC, were being fully decoded
+        # for nobody (Demi, 13 Oct 2026).
+        self.idle_when_unwatched = bool(idle_when_unwatched)
+        self.probe_source = probe_source if probe_source is not None else source
+        self.idle_probe_seconds = 30.0
+        self.idle = False
+        self.idle_probes = 0
         # A fisheye camera's Dewarp (cvti.serving.dewarp). Applied to every
         # frame before it is stored, so detection, the wall, zones and the
         # verifier all see the flattened frame and agree on its geometry.
@@ -327,8 +341,44 @@ class StreamDecoder:
                 log.warning("[link %s] state-change callback failed", self.camera_id,
                             exc_info=True)
 
+    def _wants_idle(self) -> bool:
+        return self.idle_when_unwatched and self._is_live() and self.display_fps <= 0
+
+    def _probe_alive(self) -> bool:
+        from cvti.serving.capture import rtsp_alive
+        return rtsp_alive(self.probe_source)
+
+    def _idle_until_watched(self) -> None:
+        """Hold here, decoding nothing, until a viewer appears or stop().
+        Link state is kept honest with a periodic reachability probe."""
+        self.idle = True
+        log.info("[decode %s] idle: view-only and unwatched; probing reachability "
+                 "every %.0fs instead of decoding", self.camera_id, self.idle_probe_seconds)
+        next_probe = 0.0
+        try:
+            while not self._stop.is_set() and self._wants_idle():
+                now = time.monotonic()
+                if now >= next_probe:
+                    next_probe = now + self.idle_probe_seconds
+                    self.idle_probes += 1
+                    if self._probe_alive():
+                        self.last_frame_at = time.time()
+                        if self.state != CONNECTED:
+                            self._set_state(CONNECTED, "camera reachable")
+                    elif self.state == CONNECTED:
+                        self._set_state(RECONNECTING, "camera not answering")
+                    elif (self.state == RECONNECTING
+                          and self.time_in_state >= self.offline_grace_seconds):
+                        self._set_state(OFFLINE, f"unreachable for {self.time_in_state:.0f}s")
+                self._stop.wait(0.25)
+        finally:
+            self.idle = False
+        if not self._stop.is_set():
+            log.info("[decode %s] viewer arrived; opening the stream", self.camera_id)
+
     def link_status(self) -> dict:
         return {"camera_id": self.camera_id, "state": self.state,
+                "idle": self.idle,
                 "time_in_state": round(self.time_in_state, 1),
                 "reconnects": self.reconnects,
                 "last_frame_at": self.last_frame_at,
@@ -381,6 +431,10 @@ class StreamDecoder:
 
     def _loop(self) -> None:
         import cv2
+        if self._wants_idle():
+            self._idle_until_watched()
+            if self._stop.is_set():
+                return
         cap = self._open()
         self._fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         # Sample the effective fps by SKIPPING frames, not by slowing playback:
@@ -391,6 +445,19 @@ class StreamDecoder:
         orig_index = 0
         attempt = 0
         while not self._stop.is_set():
+            if self._wants_idle():
+                # The last viewer left: release the stream and wait for the next.
+                try:
+                    cap.release()
+                except Exception:  # noqa: BLE001 - the capture is being discarded
+                    log.debug("[decode %s] release before idle failed", self.camera_id, exc_info=True)
+                self._idle_until_watched()
+                if self._stop.is_set():
+                    return
+                cap = self._open()
+                self._fps = cap.get(cv2.CAP_PROP_FPS) or self._fps
+                attempt = 0
+                continue
             if self.fell_back:
                 cap = self._maybe_return_to_relay(cap)
             stride, self._min_period = self._pacing()

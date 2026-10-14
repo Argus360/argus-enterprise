@@ -58,7 +58,8 @@ class AsyncVideoActionRunner:
     submission across cameras, so a busy camera cannot starve a quiet one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "video-action") -> None:
+        self.name = name
         self._lock = threading.Lock()
         self._pending: dict[str, _PendingClip] = {}
         self._results: dict[str, list[RawEvent]] = {}
@@ -70,7 +71,7 @@ class AsyncVideoActionRunner:
         self.failed = 0
 
     def start(self) -> "AsyncVideoActionRunner":
-        self._thread = threading.Thread(target=self._loop, name="video-action",
+        self._thread = threading.Thread(target=self._loop, name=self.name,
                                         daemon=True)
         self._thread.start()
         return self
@@ -114,7 +115,7 @@ class AsyncVideoActionRunner:
                 events = clip.run()
             except Exception:  # noqa: BLE001 - one bad clip must not kill the worker
                 self.failed += 1
-                log.warning("[VideoAction] analysis failed for %s", camera_id,
+                log.warning("[%s] analysis failed for %s", self.name, camera_id,
                             exc_info=True)
                 continue
             with self._lock:

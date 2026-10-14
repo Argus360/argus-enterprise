@@ -534,7 +534,9 @@ class MultiStreamPipeline:
                 cam_id, src, target_fps=(1.0 if vo else self.target_fps),
                 on_state_change=self._handle_link_change, view_only=vo,
                 fallback_source=self.fallback_sources.get(cam_id),
-                dewarp=self.camera_dewarp.get(cam_id)).start()
+                dewarp=self.camera_dewarp.get(cam_id),
+                idle_when_unwatched=vo,
+                probe_source=self.fallback_sources.get(cam_id, src)).start()
         if self.smooth_publish:
             import threading as _th
             self._smooth_thread = _th.Thread(target=self._smooth_publish_loop,
@@ -1203,9 +1205,16 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
     if video_action_model is not None:
         from cvti.video_action_runtime import AsyncVideoActionRunner
         va_runner = AsyncVideoActionRunner().start()
+    # Pose and weapon leave the frame loop the same way (Demi, 13 Oct 2026:
+    # 50-72 s pose calls inline stalled every camera on the pilot server).
+    heavy_runner = None
+    if pose_model is not None or weapon_model is not None:
+        from cvti.video_action_runtime import AsyncVideoActionRunner
+        heavy_runner = AsyncVideoActionRunner(name="heavy-models").start()
     cams = build_camera_states(site, pose_model=pose_model, weapon_model=weapon_model,
                                video_action_model=video_action_model,
                                va_runner=va_runner,
+                               heavy_runner=heavy_runner,
                                imgsz=imgsz,
                                baseline_config=baseline_config,
                                scene_contexts=mapping_preflight.contexts,
@@ -2023,6 +2032,11 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
         _esc_stop.set()
         pipe.stop()
         gateway.stop()
+        if heavy_runner is not None:
+            heavy_runner.stop()
+            if heavy_runner.dropped or heavy_runner.failed:
+                log.info(f"[heavy-models] passes={heavy_runner.completed} "
+                         f"replaced_stale={heavy_runner.dropped} failed={heavy_runner.failed}")
         if va_runner is not None:
             va_runner.stop()
             if va_runner.dropped or va_runner.failed:
