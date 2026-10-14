@@ -170,6 +170,32 @@ def _gate_workers_for(requested: int, n_cameras: int, *, provider: str = "",
     return max(1, min(derived, slots))
 
 
+# Decoded frames per second the wall may ask of a CPU-only box, across all
+# cameras. Watched tiles decode at the wall rate; with twelve tiles open at
+# 24 fps the pilot server decoded 288 frames a second of 5-megapixel HEVC
+# for display alone and sat at 100% CPU (bundle, 13 Oct 2026 22:37).
+CPU_WALL_DECODE_BUDGET_FPS = 96
+WALL_FPS_FLOOR = 8.0
+
+
+def wall_fps_for(site: dict, requested: float, n_cameras: int, device: str) -> float:
+    """The wall's publish rate for this site. A `wall_fps` key in the site
+    file always wins. Otherwise a CPU-only box shares CPU_WALL_DECODE_BUDGET_FPS
+    across its cameras, never below WALL_FPS_FLOOR; a GPU box keeps the
+    requested rate."""
+    explicit = site.get("wall_fps") if isinstance(site, dict) else None
+    if isinstance(explicit, (int, float)) and explicit > 0:
+        return float(explicit)
+    if device != "cpu" or n_cameras <= 0:
+        return requested
+    capped = max(WALL_FPS_FLOOR, float(CPU_WALL_DECODE_BUDGET_FPS // n_cameras))
+    if capped < requested:
+        log.info("[serving] CPU-only box with %d cameras: wall rate %.0f fps instead of %.0f "
+                 "(set wall_fps in the site file to override)", n_cameras, capped, requested)
+        return capped
+    return requested
+
+
 def _auto_device() -> str:
     try:
         import torch
@@ -1442,6 +1468,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                      "frames": [], "scene": {}, "enqueued_at": time.time()}))
 
     from cvti.serving.dewarp import dewarps_for as _dewarps_for
+    publish_fps = wall_fps_for(site, publish_fps, len(sources), device or _auto_device())
     pipe = MultiStreamPipeline(sources, weights=weights, target_fps=target_fps, imgsz=imgsz,
                                conf=conf, device=device, half=half, camera_states=states,
                                alert_queue=queue, publisher=publisher,
