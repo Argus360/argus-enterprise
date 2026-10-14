@@ -17,6 +17,7 @@ video) are injected by the pipeline; everything stateful is per camera.
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from collections import deque
@@ -211,6 +212,15 @@ class PerCameraState:
     # inference leaves the frame loop entirely: this camera submits clips and
     # drains verdicts. None = the synchronous legacy path (single-stream CLI).
     va_runner: Any = None
+    # Shared worker for the HEAVY per-camera models (pose, weapon). When set,
+    # a frame that earns them hands a copy to the worker and returns at once;
+    # verdicts are drained on later frames. None = synchronous (CLI, tests).
+    # On the pilot server a pose pass took 50-72 s per call on a saturated
+    # CPU and, run inline, stalled tracking on every camera (Demi, 13 Oct
+    # 2026). The lock keeps the worker and the frame loop off this camera's
+    # assessors at the same time; the frame loop never waits for it.
+    heavy_runner: Any = None
+    _heavy_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
     pose_conf: float = 0.35
     weapon_conf: float = 0.40
     # Inference size for the per-camera pose/weapon passes. run_site plumbs
@@ -427,6 +437,55 @@ class PerCameraState:
         pose_people = enrich_pose_people_with_history(pose_people, self._pose_history)
         self._prev_pose = list(pose_people)
         return pose_people
+
+    def _heavy_pass(self, image: Any, timestamp: float, bag_boxes: list,
+                    object_detections: list | None, *, run_heavy: bool) -> list:
+        """Pose (+ concealment) and the weapon model for one frame. With
+        run_heavy False this is the light path: rule logic on the shared
+        detections only, no model call."""
+        raw_events: list = []
+        pose_ran = self._needs_pose() and run_heavy
+        pose_people = self._compute_pose(image, timestamp) if pose_ran else []
+        if self._conceal is not None and pose_ran:
+            from cvti.detector.core import pose_people_to_concealment_frames
+            from cvti.event_adapters import concealment_to_events
+            pose_frames = pose_people_to_concealment_frames(pose_people, timestamp)
+            assessments = self._conceal.update_with_bag_detections(
+                pose_frames, timestamp, bag_boxes
+            )
+            raw_events += concealment_to_events(assessments, timestamp)
+        if self.violence or self.weapons or self.theft:
+            merged = self._merged_detections(object_detections, image,
+                                             include_weapon=run_heavy)
+            raw_events += self._assessment_events(pose_people, merged, image, timestamp)
+        return raw_events
+
+    def _heavy_submit_or_light(self, run_heavy: bool, image: Any, timestamp: float,
+                               bag_boxes: list, object_detections: list | None) -> list:
+        """With a heavy_runner: a frame that earned the heavy models hands a
+        copy to the worker and returns at once. Any other frame runs the
+        light path here, unless the worker is mid-pass on this camera."""
+        wants_heavy = run_heavy and (self._needs_pose() or (
+            self.weapon_model is not None and (self.violence or self.weapons or self.theft)))
+        if wants_heavy:
+            snapshot = (image.copy(), timestamp, list(bag_boxes or []),
+                        list(object_detections or []))
+            lock = self._heavy_lock
+
+            def job(snap=snapshot):
+                with lock:
+                    return self._heavy_pass(*snap, run_heavy=True)
+            self.heavy_runner.submit(self.camera_id, job)
+            return []
+        if not (self.violence or self.weapons or self.theft):
+            return []
+        if not self._heavy_lock.acquire(blocking=False):
+            return []                 # the worker holds this camera's assessors
+        try:
+            return self._heavy_pass(image, timestamp, bag_boxes, object_detections,
+                                    run_heavy=False)
+        finally:
+            self._heavy_lock.release()
 
     def _merged_detections(self, object_detections: list | None, image: Any,
                            include_weapon: bool = True) -> list:
@@ -922,8 +981,11 @@ class PerCameraState:
                     })
 
         try:
-            if self._conceal is not None:
-                self._conceal.expire(timestamp)
+            if self._conceal is not None and self._heavy_lock.acquire(blocking=False):
+                try:
+                    self._conceal.expire(timestamp)
+                finally:
+                    self._heavy_lock.release()
             # Person-gate + cadence for the HEAVY per-camera models (audit
             # 1 Sep, D3). Pose and weapon are full forward passes per camera
             # per frame, and they ran unconditionally — on empty corridors,
@@ -943,21 +1005,13 @@ class PerCameraState:
             self._heavy_tick += 1
             run_heavy = person_present and (
                 first_appearance or self._heavy_tick % max(1, self.heavy_stride) == 0)
-            pose_ran = self._needs_pose() and run_heavy
-            pose_people = self._compute_pose(image, timestamp) if pose_ran else []
-            if self._conceal is not None:
-                from cvti.detector.core import pose_people_to_concealment_frames
-                from cvti.event_adapters import concealment_to_events
-                if pose_ran:
-                    pose_frames = pose_people_to_concealment_frames(pose_people, timestamp)
-                    assessments = self._conceal.update_with_bag_detections(
-                        pose_frames, timestamp, bag_boxes
-                    )
-                    raw_events += concealment_to_events(assessments, timestamp)
-            if self.violence or self.weapons or self.theft:
-                merged = self._merged_detections(object_detections, image,
-                                                 include_weapon=run_heavy)
-                raw_events += self._assessment_events(pose_people, merged, image, timestamp)
+            if self.heavy_runner is not None:
+                raw_events += self.heavy_runner.drain(self.camera_id)
+                raw_events += self._heavy_submit_or_light(
+                    run_heavy, image, timestamp, bag_boxes, object_detections)
+            else:
+                raw_events += self._heavy_pass(image, timestamp, bag_boxes, object_detections,
+                                               run_heavy=run_heavy)
             # Video-action runs on a CADENCE, not only when another signal fired.
             # Gating it behind concealment meant theft that isn't concealment-
             # shaped (e.g. a grab-and-go) was never seen by the fine-tuned model —
@@ -1183,6 +1237,7 @@ def rules_config_for(cam: dict) -> str:
 def build_camera_states(site_config: dict, *, pose_model: Any = None, weapon_model: Any = None,
                         video_action_model: Any = None,
                         va_runner: Any = None,
+                        heavy_runner: Any = None,
                         baseline_config: str | None = None,
                         scene_contexts: dict[str, dict] | None = None,
                         monitoring_scopes: dict[str, str] | None = None,
@@ -1368,6 +1423,7 @@ def build_camera_states(site_config: dict, *, pose_model: Any = None, weapon_mod
                 pose_model=pose_model, weapon_model=weapon_model,
                 video_action_model=video_action_model,
                 va_runner=va_runner,
+                heavy_runner=heavy_runner,
                 # The engine's one inference size: pose/weapon run at the
                 # same imgsz as the shared detector, not a leaked default.
                 imgsz=imgsz,

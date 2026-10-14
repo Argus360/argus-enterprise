@@ -83,6 +83,36 @@ def _live_decode_params(cv2) -> list:
     return []          # older OpenCV: no such knob, keep the old behaviour
 
 
+# Set the first time the hardware-decode open fails and the software open
+# succeeds: a box with no usable GPU (the pilot server) paid a failed D3D11
+# attempt plus a warning on EVERY reconnect of every camera (13 Oct 2026).
+_HW_DECODE_FAILED = False
+
+
+def rtsp_alive(source: Any, timeout: float = 4.0) -> bool:
+    """Is the camera reachable, without decoding anything: one TCP connect
+    and one RTSP OPTIONS. Any RTSP reply (200, 401, 404...) means a camera
+    is answering; no reply or a refused connection means it is not. For a
+    non-RTSP network source, the TCP connect alone decides."""
+    import socket
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(source))
+        host, port = parts.hostname, parts.port or (554 if parts.scheme.startswith("rtsp") else 80)
+        if not host:
+            return False
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            if not parts.scheme.startswith("rtsp"):
+                return True
+            bare = parts._replace(netloc=f"{host}:{port}").geturl()
+            sock.sendall(f"OPTIONS {bare} RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: argus-engine/1\r\n\r\n".encode())
+            sock.settimeout(timeout)
+            reply = sock.recv(256)
+            return reply.startswith(b"RTSP/")
+    except (OSError, ValueError):
+        return False
+
+
 def open_capture(source: Any, *, low_latency: bool = True):
     """Open `source` with the right backend and the least buffering.
 
@@ -91,8 +121,9 @@ def open_capture(source: Any, *, low_latency: bool = True):
     """
     import cv2
 
+    global _HW_DECODE_FAILED
     src = int(source) if str(source).isdigit() else source
-    hw = _hw_decode_params(cv2)
+    hw = [] if _HW_DECODE_FAILED else _hw_decode_params(cv2)
     live_params = _live_decode_params(cv2) if low_latency else []
 
     if isinstance(src, int):
@@ -124,11 +155,16 @@ def open_capture(source: Any, *, low_latency: bool = True):
             # ANY should fall back internally; if a broken driver still
             # refuses the open, software decode beats no camera. Retry keeps
             # the single-thread ask — it is a latency fix, not an accelerator.
-            log.warning("network capture open failed; retrying software decode")
             cap.release()
             software_params = live_params + timeouts
             cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG, software_params) if software_params \
                 else cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+            if cap.isOpened():
+                _HW_DECODE_FAILED = True
+                log.warning("hardware decode open failed; retrying software decode worked, "
+                            "so software decode from now on (no further hardware attempts)")
+            else:
+                log.warning("network capture open failed with and without hardware decode")
     else:
         # A file: same free decode upgrade (demo clips are video too).
         cap = cv2.VideoCapture(src, cv2.CAP_ANY, hw) if hw else cv2.VideoCapture(src)
