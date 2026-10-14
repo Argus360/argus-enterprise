@@ -138,7 +138,7 @@ class DecoderPolicyTests(unittest.TestCase):
     def test_the_pipeline_turns_it_on_for_cpu_boxes_and_the_site_can_override(self):
         from cvti.serving import pipeline
         src = inspect.getsource(pipeline.MultiStreamPipeline.start)
-        self.assertIn('else self.device == "cpu"', src)
+        self.assertIn('else compute_device(self.device) == "cpu"', src)
         self.assertIn("keyframes_only_min_width=(self.keyframe_min_width if keyframes else 0)", src)
         self.assertIn('keyframe_decode=(bool(site["keyframe_decode"])', inspect.getsource(pipeline.run_site))
 
@@ -210,3 +210,25 @@ class DetectorThreadsTests(unittest.TestCase):
         src = inspect.getsource(pipeline.MultiStreamPipeline.start)
         self.assertIn("accel.DETECTOR_THREADS = ", src)
         self.assertIn('detector_threads=(int(site["detector_threads"])', inspect.getsource(pipeline.run_site))
+
+
+class ComputeDeviceTests(unittest.TestCase):
+    """The installed Windows build ships a CPU torch and detects on the GPU
+    through DirectML: the torch device alone called an RTX box CPU-only."""
+
+    def test_a_directml_box_is_not_cpu_only(self):
+        from cvti.serving import pipeline
+        with mock.patch("cvti.detector.accel.best_available_provider", return_value="DmlExecutionProvider"):
+            self.assertEqual(pipeline.compute_device("cpu"), "dml")
+            self.assertEqual(pipeline.wall_fps_for({}, 24.0, 12, pipeline.compute_device("cpu")), 24.0)
+        with mock.patch("cvti.detector.accel.best_available_provider", return_value=None):
+            self.assertEqual(pipeline.compute_device("cpu"), "cpu")
+        self.assertEqual(pipeline.compute_device("cuda"), "cuda")
+
+    def test_the_three_cpu_only_decisions_use_it(self):
+        from cvti.serving import pipeline
+        start = inspect.getsource(pipeline.MultiStreamPipeline.start)
+        self.assertIn('compute_device(self.device) == "cpu"', start)
+        self.assertIn("detector_threads_for(None, compute_device(self.device))", start)
+        self.assertIn("wall_fps_for(site, publish_fps, len(sources), compute_device(device))",
+                      inspect.getsource(pipeline.run_site))
