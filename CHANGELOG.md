@@ -4,6 +4,10 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## [Unreleased]
+
+- Added a standalone read-only profiler for CPU, memory, GPU, engine timing, and optional Python stack samples during live monitoring and capacity tests.
+
 ## v1.10.9 — 14 Oct 2026
 
 **A computer with a graphics card is treated as one.** The installed app
