@@ -666,6 +666,30 @@ class SmoothPublishTest(unittest.TestCase):
         self.assertEqual(_frame_overlays(state, 12.0), [])
         self.assertEqual(len(_frame_overlays(state, 12.0, exact_frame=True)), 1)
 
+    def test_smooth_person_boxes_live_as_long_as_the_camera_is_slow(self):
+        """A box refreshed every 4.7 s (CHI, 13 Oct) expired after 1 s and was
+        never drawn. The lifetime follows the measured detection interval:
+        twice it, at least a second, at most ten."""
+        from cvti.serving.pipeline import _frame_overlays, _overlay_max_age
+        state = SimpleNamespace(
+            _motion_overlay_observed_at=10.0, _detection_interval_s=4.7,
+            _motion_overlays=[{"track_id": 1, "bbox": (1, 2, 30, 40), "label": "PERSON"}],
+        )
+        self.assertAlmostEqual(_overlay_max_age(state), 9.4)
+        self.assertEqual(len(_frame_overlays(state, 15.0)), 1)      # 5 s old: still shown
+        self.assertEqual(_frame_overlays(state, 20.0), [])          # 10 s old: gone
+        state._detection_interval_s = 30.0
+        self.assertEqual(_overlay_max_age(state), 10.0)             # capped
+        state._detection_interval_s = 0.2
+        self.assertEqual(_overlay_max_age(state), 1.0)              # floored
+
+    def test_the_route_stamps_a_smoothed_detection_interval(self):
+        import inspect
+        from cvti.serving import pipeline as pl
+        src = inspect.getsource(pl.MultiStreamPipeline._route_to_queue)
+        self.assertIn("_detection_interval_s", src)
+        self.assertIn("0.5 * last + 0.5 * gap", src)
+
     def test_aggregate_track_ids_reach_publisher_alert_state(self):
         from cvti.contracts import CandidateAlert
         from cvti.serving.pipeline import _alert_track_ids
