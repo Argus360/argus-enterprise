@@ -161,8 +161,8 @@ def open_capture(source: Any, *, low_latency: bool = True):
                 else cv2.VideoCapture(src, cv2.CAP_FFMPEG)
             if cap.isOpened():
                 _HW_DECODE_FAILED = True
-                log.warning("hardware decode is not available on this machine; "
-                            "software decode from now on (no further attempts)")
+                log.warning("hardware decode open failed; retrying software decode worked, "
+                            "so software decode from now on (no further hardware attempts)")
             else:
                 log.warning("network capture open failed with and without hardware decode")
     else:
