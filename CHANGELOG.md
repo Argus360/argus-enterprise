@@ -4,6 +4,29 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.7 — 14 Oct 2026
+
+Two changes for a server with no graphics card and many large cameras.
+Install this one.
+
+**Large cameras decode only keyframes.** A 5-megapixel camera used to be
+decoded frame by frame, every frame, before the detector saw anything;
+seven of them filled the pilot server's processor on their own. On a
+computer without a graphics card, a live stream 2000 pixels wide or more is
+now decoded one picture per keyframe, about once a second, at a small
+fraction of the cost. The detector gets about one look a second at such a
+camera instead of one every three; its wall tile updates about once a
+second until the camera is moved to its smaller substream, at which point
+full decoding returns by itself. Smaller cameras are unchanged. The site
+file can switch this off (`keyframe_decode: false`) or move the size limit
+(`keyframe_min_width`).
+
+**The wall shares a decode budget.** Every open tile used to decode its
+camera at 24 frames a second; twelve open tiles on five processors was
+most of the load. On a computer without a graphics card the wall rate is
+now shared across the cameras, twelve cameras at 8 frames a second each,
+four at 24, never below 8. `wall_fps` in the site file overrides it.
+
 ## v1.10.6 — 14 Oct 2026
 
 The engine changes from the pilot server's 13 October diagnostics. Install
