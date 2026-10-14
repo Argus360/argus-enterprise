@@ -445,8 +445,14 @@ class MultiStreamPipeline:
                  object_watch_runtime: Any = None,
                  camera_inference: dict | None = None,
                  synchronized_box_cameras: set[str] | None = None,
-                 camera_dewarp: dict | None = None) -> None:
+                 camera_dewarp: dict | None = None,
+                 keyframe_decode: bool | None = None,
+                 keyframe_min_width: int = 2000) -> None:
         self.synchronized_box_cameras = set(synchronized_box_cameras or ())
+        # Keyframe-only decode for big live streams: None = on for CPU-only
+        # boxes, off with a GPU. A site can force it either way.
+        self.keyframe_decode = keyframe_decode
+        self.keyframe_min_width = int(keyframe_min_width)
         # camera_id -> Dewarp (cvti.serving.dewarp): fisheye cameras are
         # flattened in the decoder, before any consumer sees a frame.
         self.camera_dewarp: dict = dict(camera_dewarp or {})
@@ -566,6 +572,12 @@ class MultiStreamPipeline:
         # now viewer-aware: the smooth loop raises display_fps on exactly the
         # cameras with an open /stream connection and drops it when the last
         # viewer leaves. Smoother where eyes are, ~3x cheaper where none are.
+        keyframes = (self.keyframe_decode if self.keyframe_decode is not None
+                     else self.device == "cpu")
+        if keyframes:
+            log.info("[serving] CPU-only box: live streams %d px wide or more decode keyframes "
+                     "only (keyframe_decode / keyframe_min_width in the site file override)",
+                     self.keyframe_min_width)
         for cam_id, src in self.sources.items():
             vo = cam_id in self.view_only
             # A view-only camera decodes just enough to keep its link state
@@ -578,7 +590,8 @@ class MultiStreamPipeline:
                 fallback_source=self.fallback_sources.get(cam_id),
                 dewarp=self.camera_dewarp.get(cam_id),
                 idle_when_unwatched=vo,
-                probe_source=self.fallback_sources.get(cam_id, src)).start()
+                probe_source=self.fallback_sources.get(cam_id, src),
+                keyframes_only_min_width=(self.keyframe_min_width if keyframes else 0)).start()
         if self.smooth_publish:
             import threading as _th
             self._smooth_thread = _th.Thread(target=self._smooth_publish_loop,
@@ -1482,7 +1495,10 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                                  if "detection_inference" in c},
                                synchronized_box_cameras={str(c["id"]) for c in site.get("cameras", [])
                                                          if c.get("box_display") == "synchronized"},
-                               camera_dewarp=_dewarps_for(site.get("cameras", [])))
+                               camera_dewarp=_dewarps_for(site.get("cameras", [])),
+                               keyframe_decode=(bool(site["keyframe_decode"])
+                                                if isinstance(site.get("keyframe_decode"), bool) else None),
+                               keyframe_min_width=int(site.get("keyframe_min_width", 2000) or 2000))
 
     def _fast_path(alert) -> None:
         """Two-tier alerting (EP-06-T4): criticals are shown provisionally the
