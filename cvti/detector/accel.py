@@ -100,27 +100,60 @@ def _patch_ultralytics_providers() -> None:
     _PATCHED = True
 
 
+# Threads the CPU detector session may use. 0 = onnxruntime's default, every
+# core. On the pilot server the detector ran back to back on all five vCPUs
+# and the wall, the relay and the verifier got the scraps (14 Oct 2026):
+# run_site sets this from the site file or detector_threads_for().
+DETECTOR_THREADS = 0
+
+
+def detector_threads_for(site: dict | None, device: str) -> int:
+    """How many threads the detector gets. `detector_threads` in the site
+    file wins; otherwise a CPU-only box with three or more cores keeps one
+    core free for everything that is not detection; a GPU box is unlimited."""
+    import os
+    explicit = (site or {}).get("detector_threads") if isinstance(site, dict) else None
+    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit > 0:
+        return explicit
+    if device != "cpu":
+        return 0
+    cores = os.cpu_count() or 1
+    return max(1, cores - 1) if cores >= 3 else cores
+
+
 def _ensure_preferred_provider(backend_instance, weight) -> bool:
-    """Rebuild a CPU-only session on the box's preferred provider. True when
-    a rebuild happened. Split out of the wrapper so the seam is testable
-    without constructing a real ultralytics backend. Anything unexpected
-    leaves the original session standing: worst case is today's CPU speed,
-    never a broken detector."""
+    """Rebuild a CPU-only session on the box's preferred provider, or with
+    the thread cap when there is no better provider. True when a rebuild
+    happened. Split out of the wrapper so the seam is testable without
+    constructing a real ultralytics backend. Anything unexpected leaves the
+    original session standing: worst case is today's CPU speed, never a
+    broken detector."""
     try:
         session = getattr(backend_instance, "session", None)
         provider = best_available_provider()
-        if (session is None or provider is None
-                or session.get_providers()[0] != "CPUExecutionProvider"):
+        if session is None or session.get_providers()[0] != "CPUExecutionProvider":
             return False
         import onnxruntime
-        backend_instance.session = onnxruntime.InferenceSession(
-            str(weight), providers=[provider, "CPUExecutionProvider"])
-        backend_instance.output_names = [
-            x.name for x in backend_instance.session.get_outputs()]
-        log.info("[detect] session rebuilt on %s (ultralytics chose CPU)", provider)
-        return True
+        if provider is not None:
+            backend_instance.session = onnxruntime.InferenceSession(
+                str(weight), providers=[provider, "CPUExecutionProvider"])
+            backend_instance.output_names = [
+                x.name for x in backend_instance.session.get_outputs()]
+            log.info("[detect] session rebuilt on %s (ultralytics chose CPU)", provider)
+            return True
+        if DETECTOR_THREADS > 0:
+            options = onnxruntime.SessionOptions()
+            options.intra_op_num_threads = int(DETECTOR_THREADS)
+            backend_instance.session = onnxruntime.InferenceSession(
+                str(weight), options, providers=["CPUExecutionProvider"])
+            backend_instance.output_names = [
+                x.name for x in backend_instance.session.get_outputs()]
+            log.info("[detect] CPU session rebuilt with %d thread(s) so the wall, relay "
+                     "and verifier keep a core", DETECTOR_THREADS)
+            return True
+        return False
     except Exception:  # noqa: BLE001 - the original session keeps working
-        log.warning("[detect] provider rebuild failed — staying on CPU",
+        log.warning("[detect] session rebuild failed — staying on the original session",
                     exc_info=True)
         return False
 

@@ -145,3 +145,68 @@ class DecoderPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceWidthTests(unittest.TestCase):
+    """The three ceiling fisheyes were judged by their 1600 px panorama and
+    never switched to keyframe decode (14 Oct 2026)."""
+
+    def test_a_dewarped_big_stream_still_switches_to_keyframes(self):
+        from cvti.serving import streams as st
+        from cvti.serving.dewarp import Dewarp
+        opens = []
+        def fake_open(source, keyframes_only=False, **_kw):
+            cap = _Cap(2592, keyframes_only=keyframes_only); opens.append(cap); return cap
+        d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=30.0,
+                             keyframes_only_min_width=2000,
+                             dewarp=Dewarp.from_config({"mode": "panorama", "output": [1600, 500]}))
+        with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
+            d.start()
+            deadline = time.time() + 3.0
+            while time.time() < deadline and len(opens) < 2:
+                time.sleep(0.02)
+            d.stop()
+        self.assertEqual((d.source_width, d.stream_width), (2592, 1600))
+        self.assertGreaterEqual(len(opens), 2)
+        self.assertTrue(opens[1].keyframes_only)
+        self.assertEqual(d.ingest_status()["source_width"], 2592)
+
+
+class DetectorThreadsTests(unittest.TestCase):
+    def test_a_cpu_box_keeps_one_core_free_and_the_site_can_override(self):
+        from cvti.detector import accel
+        with mock.patch("os.cpu_count", return_value=5):
+            self.assertEqual(accel.detector_threads_for({}, "cpu"), 4)
+            self.assertEqual(accel.detector_threads_for({"detector_threads": 2}, "cpu"), 2)
+            self.assertEqual(accel.detector_threads_for({"detector_threads": True}, "cpu"), 4)
+            self.assertEqual(accel.detector_threads_for({}, "cuda"), 0)
+        with mock.patch("os.cpu_count", return_value=2):
+            self.assertEqual(accel.detector_threads_for({}, "cpu"), 2)
+
+    def test_the_cpu_session_is_rebuilt_with_the_cap_when_no_better_provider_exists(self):
+        from cvti.detector import accel
+        inst = mock.Mock()
+        inst.session.get_providers.return_value = ["CPUExecutionProvider"]
+        fake_ort = mock.Mock()
+        fake_ort.InferenceSession.return_value.get_outputs.return_value = []
+        with mock.patch.dict(sys.modules, {"onnxruntime": fake_ort}), \
+             mock.patch.object(accel, "best_available_provider", return_value=None), \
+             mock.patch.object(accel, "DETECTOR_THREADS", 4):
+            self.assertTrue(accel._ensure_preferred_provider(inst, "m.onnx"))
+        self.assertEqual(fake_ort.SessionOptions.return_value.intra_op_num_threads, 4)
+        args, kwargs = fake_ort.InferenceSession.call_args
+        self.assertEqual(kwargs.get("providers"), ["CPUExecutionProvider"])
+
+    def test_no_cap_and_no_provider_leaves_the_session_alone(self):
+        from cvti.detector import accel
+        inst = mock.Mock()
+        inst.session.get_providers.return_value = ["CPUExecutionProvider"]
+        with mock.patch.object(accel, "best_available_provider", return_value=None), \
+             mock.patch.object(accel, "DETECTOR_THREADS", 0):
+            self.assertFalse(accel._ensure_preferred_provider(inst, "m.onnx"))
+
+    def test_the_pipeline_sets_the_cap_before_loading(self):
+        from cvti.serving import pipeline
+        src = inspect.getsource(pipeline.MultiStreamPipeline.start)
+        self.assertIn("accel.DETECTOR_THREADS = ", src)
+        self.assertIn('detector_threads=(int(site["detector_threads"])', inspect.getsource(pipeline.run_site))
