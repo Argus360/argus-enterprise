@@ -196,6 +196,24 @@ def wall_fps_for(site: dict, requested: float, n_cameras: int, device: str) -> f
     return requested
 
 
+def compute_device(device: str = "") -> str:
+    """Where detection actually runs: "cpu" only when torch would run on the
+    CPU AND onnxruntime has no better provider. The installed Windows build
+    ships a CPU torch and does its detection on the GPU through DirectML, so
+    the torch device alone called an RTX box "CPU-only" and would have put it
+    on keyframe decode and the 8 fps wall (14 Oct 2026)."""
+    torch_device = device or _auto_device()
+    if torch_device != "cpu":
+        return torch_device
+    try:
+        from cvti.detector.accel import best_available_provider
+        provider = best_available_provider()
+    except Exception:  # noqa: BLE001 - a probe must never change the answer to worse than cpu
+        log.debug("provider probe failed; treating the box as CPU-only", exc_info=True)
+        provider = None
+    return "cpu" if provider is None else provider.replace("ExecutionProvider", "").lower()
+
+
 def _auto_device() -> str:
     try:
         import torch
@@ -544,7 +562,7 @@ class MultiStreamPipeline:
         from cvti.detector import accel
         from cvti.detector.accel import load_detector
         accel.DETECTOR_THREADS = (self.detector_threads if self.detector_threads is not None
-                                  else accel.detector_threads_for(None, self.device))
+                                  else accel.detector_threads_for(None, compute_device(self.device)))
         self._model, self.detector_info = load_detector(
             self.weights, backend=self.detector_backend, device=self.device)
         self._camera_inference.load(self._model)
@@ -580,7 +598,7 @@ class MultiStreamPipeline:
         # cameras with an open /stream connection and drops it when the last
         # viewer leaves. Smoother where eyes are, ~3x cheaper where none are.
         keyframes = (self.keyframe_decode if self.keyframe_decode is not None
-                     else self.device == "cpu")
+                     else compute_device(self.device) == "cpu")
         if keyframes:
             log.info("[serving] CPU-only box: live streams %d px wide or more decode keyframes "
                      "only (keyframe_decode / keyframe_min_width in the site file override)",
@@ -1488,7 +1506,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                      "frames": [], "scene": {}, "enqueued_at": time.time()}))
 
     from cvti.serving.dewarp import dewarps_for as _dewarps_for
-    publish_fps = wall_fps_for(site, publish_fps, len(sources), device or _auto_device())
+    publish_fps = wall_fps_for(site, publish_fps, len(sources), compute_device(device))
     pipe = MultiStreamPipeline(sources, weights=weights, target_fps=target_fps, imgsz=imgsz,
                                conf=conf, device=device, half=half, camera_states=states,
                                alert_queue=queue, publisher=publisher,
