@@ -6,13 +6,17 @@ import csv
 import datetime as dt
 import json
 import math
+import os
 import platform
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from statistics import mean
@@ -72,6 +76,54 @@ def read_json(path: Path) -> dict:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def fresh_run_dir(requested: Path | None) -> Path | None:
+    """Prefer the active installed feed over a stale site output directory."""
+    choices = [requested] if requested else []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        root = Path(appdata) / "Argus"
+        choices.extend((root / "runs" / "feeds").glob("*/gate_health.json"))
+        choices.append(root / "site" / "gate_health.json")
+    candidates = []
+    for choice in choices:
+        if choice is None:
+            continue
+        directory = choice if choice.is_dir() else choice.parent
+        health = read_json(directory / "gate_health.json")
+        stamp = health.get("generated_at")
+        if isinstance(stamp, (int, float)) and 0 <= time.time() - stamp <= 30:
+            candidates.append((stamp, directory))
+    return max(candidates, default=(0, requested))[1]
+
+
+def pyspy_binary() -> str | None:
+    sibling = Path(sys.executable).with_name("py-spy.exe" if os.name == "nt" else "py-spy")
+    return str(sibling) if sibling.is_file() else shutil.which("py-spy")
+
+
+def go_stack_port(run_dir: Path, running_pids: set[int]) -> int | None:
+    """Use only the loopback API descriptor belonging to a sampled gateway PID."""
+    try:
+        pid = int((run_dir / "go2rtc.pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if pid not in running_pids:
+        return None
+    descriptor = read_json(run_dir / "stream_gateway.json")
+    port = descriptor.get("api_port")
+    return port if isinstance(port, int) and 1 <= port <= 65535 else None
+
+
+def save_go_stack(port: int, target: Path, stamp: str, pid: int) -> None:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stack", timeout=3) as response:
+        data = response.read(2_000_001)
+    if len(data) > 2_000_000:
+        raise ValueError("go2rtc stack response exceeded 2 MB")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"Captured {stamp}; go2rtc PID {pid}\n\n" +
+                      data.decode("utf-8", errors="replace"), encoding="utf-8")
 
 
 def read_engine(run_dir: Path) -> dict:
@@ -250,10 +302,15 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, help="parent for timestamped output")
     parser.add_argument("--gpu", choices=("auto", "none", "nvidia", "jetson"), default="auto")
     parser.add_argument("--gpu-interval", type=float, default=5)
-    parser.add_argument("--stacks", action="store_true", help="capture engine Python stacks")
+    parser.add_argument("--stacks", dest="stacks", action="store_true", default=True,
+                        help="capture Python and go2rtc stacks (default)")
+    parser.add_argument("--no-stacks", dest="stacks", action="store_false",
+                        help="disable stack capture for clean capacity benchmarks")
     parser.add_argument("--stack-rate", type=int, default=50)
+    parser.add_argument("--go-stack-interval", type=float, default=15)
     args = parser.parse_args()
-    if min(args.duration, args.interval, args.gpu_interval, args.stack_rate) <= 0:
+    if min(args.duration, args.interval, args.gpu_interval, args.stack_rate,
+           args.go_stack_interval) <= 0:
         parser.error("duration, intervals, and stack rate must be positive")
     label = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.label).strip(".-")[:60] or "run"
     root = args.output_dir or Path(__file__).with_name("runs")
@@ -261,12 +318,18 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=False)
     print(f"Writing profile to {output.resolve()}", flush=True)
     logical = psutil.cpu_count(logical=True) or 1
-    manifest = {"version": 1, "label": args.label, "started_utc": utc_now(),
+    run_dir = fresh_run_dir(args.run_dir)
+    if args.run_dir and run_dir != args.run_dir:
+        print(f"Using active engine output: {run_dir} (requested directory is stale)", flush=True)
+    elif args.run_dir and not read_engine(args.run_dir)["health_fresh"]:
+        print(f"Warning: {args.run_dir} has no fresh engine health yet; looking for an active feed.", flush=True)
+    manifest = {"version": 2, "label": args.label, "started_utc": utc_now(),
                 "host": socket.gethostname(), "os": platform.platform(),
                 "logical_cpus": logical, "physical_cpus": psutil.cpu_count(logical=False),
                 "memory_total_gb": round(psutil.virtual_memory().total / 2**30, 2),
                 "interval_s": args.interval, "requested_duration_s": args.duration,
-                "run_dir_used": bool(args.run_dir), "stacks_requested": args.stacks}
+                "requested_run_dir": str(args.run_dir) if args.run_dir else None,
+                "stacks_requested": args.stacks}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     gpu_backend, jetson = select_gpu(args.gpu)
     psutil.cpu_percent(interval=None)
@@ -276,11 +339,16 @@ def main() -> None:
     gpu_value = {}
     process_rows, system_rows, engine_rows = [], [], []
     excluded = 0
+    go_stack_count = 0
+    go_stack_error = None
+    last_go_stack = -args.go_stack_interval
     stack_proc = stack_handle = None
-    stack_status = {"requested": args.stacks, "status": "not requested"}
-    pyspy = shutil.which("py-spy") if args.stacks else None
+    stack_status = {"requested": args.stacks,
+                    "status": "no engine observed" if args.stacks else "not requested"}
+    pyspy = pyspy_binary() if args.stacks else None
     if args.stacks and not pyspy:
-        stack_status["status"] = "py-spy not found on PATH"
+        stack_status["status"] = "py-spy not found beside Python or on PATH"
+        print("Warning: py-spy not found; Python source-line stacks will be unavailable.", flush=True)
     try:
         with (output / "processes.csv").open("w", newline="", encoding="utf-8") as pf, \
              (output / "system.csv").open("w", newline="", encoding="utf-8") as sf, \
@@ -331,6 +399,24 @@ def main() -> None:
                     pw.writerow(record)
                     process_rows.append(record)
                 previous, previous_at = current, now
+                if not run_dir or not read_engine(run_dir)["health_fresh"]:
+                    found = fresh_run_dir(args.run_dir)
+                    if found and found != run_dir:
+                        run_dir = found
+                        print(f"Using active engine output: {run_dir}", flush=True)
+                if args.stacks and run_dir and elapsed - last_go_stack >= args.go_stack_interval:
+                    gateways = {r["pid"] for r in current.values() if r["role"] == "go2rtc"}
+                    hot = any(r["role"] == "go2rtc" and r["cpu_cores"] >= 0.2
+                              for r in process_rows if r["utc"] == stamp)
+                    port = go_stack_port(run_dir, gateways) if hot else None
+                    if port:
+                        last_go_stack = elapsed
+                        try:
+                            save_go_stack(port, output / "go2rtc_stacks" /
+                                          f"{go_stack_count + 1:03d}.txt", stamp, next(iter(gateways)))
+                            go_stack_count += 1
+                        except (OSError, ValueError, urllib.error.URLError) as exc:
+                            go_stack_error = type(exc).__name__ + ": " + str(exc)
                 if gpu_backend == "nvidia-smi" and now >= next_gpu_at:
                     gpu_value = nvidia_gpu() or {}
                     next_gpu_at = now + args.gpu_interval
@@ -344,8 +430,8 @@ def main() -> None:
                           **{k: gpu_value.get(k) for k in ("gpu_util_pct", "gpu_used_mb", "gpu_total_mb")}}
                 sw.writerow(system)
                 system_rows.append(system)
-                if args.run_dir:
-                    engine = {"utc": stamp, "elapsed_s": elapsed, **read_engine(args.run_dir)}
+                if run_dir:
+                    engine = {"utc": stamp, "elapsed_s": elapsed, **read_engine(run_dir)}
                     ew.writerow(engine)
                     engine_rows.append(engine)
                 pf.flush(); sf.flush(); ef.flush()
@@ -383,6 +469,9 @@ def main() -> None:
         gpu_values = [r["gpu_util_pct"] for r in system_rows if r["gpu_util_pct"] is not None]
         summary = {"label": args.label, "started_utc": manifest["started_utc"],
                    "finished_utc": utc_now(), "elapsed_s": round(time.monotonic() - started, 1),
+                   "resolved_run_dir": str(run_dir) if run_dir else None,
+                   "go2rtc_stack_snapshots": go_stack_count,
+                   "go2rtc_stack_error": go_stack_error,
                    "logical_cpus": logical, "sample_count": len(system_rows),
                    "excluded_impossible_process_samples": excluded,
                    "mean_system_cpu_pct": round(mean(r["cpu_pct"] for r in system_rows), 1)

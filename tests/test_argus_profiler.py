@@ -2,7 +2,7 @@
 import json
 import time
 
-from tools.argus_profiler.profile import cpu_cores, read_engine, role_for
+from tools.argus_profiler.profile import cpu_cores, fresh_run_dir, go_stack_port, read_engine, role_for
 
 
 def test_cpu_cores_rejects_counter_outlier_and_reset():
@@ -41,3 +41,22 @@ def test_engine_metrics_omits_stale_stage_timings(tmp_path):
     assert metrics["health_fresh"] is True
     assert metrics["perf_fresh"] is False
     assert metrics["detect_p95_ms"] is None
+
+
+def test_discovers_fresh_feed_when_requested_site_is_stale(tmp_path, monkeypatch):
+    root = tmp_path / "Argus"
+    site = root / "site"
+    feed = root / "runs" / "feeds" / "live"
+    site.mkdir(parents=True)
+    feed.mkdir(parents=True)
+    (site / "gate_health.json").write_text(json.dumps({"generated_at": time.time() - 3600}))
+    (feed / "gate_health.json").write_text(json.dumps({"generated_at": time.time()}))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    assert fresh_run_dir(site) == feed
+
+
+def test_go_stack_port_requires_matching_live_pid(tmp_path):
+    (tmp_path / "go2rtc.pid").write_text("1234")
+    (tmp_path / "stream_gateway.json").write_text(json.dumps({"api_port": 62943}))
+    assert go_stack_port(tmp_path, {1234}) == 62943
+    assert go_stack_port(tmp_path, {9999}) is None
