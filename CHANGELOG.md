@@ -4,6 +4,41 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.6 — 14 Oct 2026
+
+The engine changes from the pilot server's 13 October diagnostics. Install
+this one.
+
+**Heavy analysis no longer stalls the cameras.** Pose estimation and the
+weapon model used to run inside each camera's frame path; on the pilot
+server one call took up to 72 seconds and every camera waited. They now run
+on a background worker: a frame hands over a copy and carries on, and the
+result arrives a moment later.
+
+**Person boxes stay on screen long enough to be seen.** The wall discarded
+any box older than one second, but a camera checked every five seconds
+never had a box younger than that, so working detection looked like none.
+Boxes now stay for twice the camera's own detection interval, between one
+and ten seconds.
+
+**Cameras nobody is watching stop costing video decoding.** A view-only
+camera with no open tile decodes nothing; it checks that the camera still
+answers every 30 seconds and opens the stream the moment a tile is watched.
+
+**Fewer failed hardware-decode attempts.** On a computer without a usable
+graphics card every reconnect tried hardware decoding first and logged a
+failure. The first failure is now remembered.
+
+**Fisheye: the image circle is found properly.** The first pictures out of
+a camera are often blank placeholders; the circle finder used to accept
+those and fix a centred guess for the whole run. It now keeps looking until
+a real picture arrives.
+
+**Web and HLS cameras no longer cost a second encode.** Such a camera went
+through the video relay, which re-encoded it in full before the engine
+decoded it again. Those cameras now go straight to the engine; RTSP cameras
+are unchanged.
+
 ## v1.10.5 — 13 Oct 2026
 
 **Fisheye cameras are flattened before anything looks at them.** Seven of
