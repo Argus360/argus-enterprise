@@ -519,6 +519,7 @@ class StreamDecoder:
         try:
             raw = int(cap.get(6))              # cv2.CAP_PROP_FOURCC, no cv2 import here
         except Exception:  # noqa: BLE001 - a capture that cannot answer is "unknown"
+            log.debug("codec probe failed; treating the codec as unknown", exc_info=True)
             return ""
         if raw <= 0:
             return ""
