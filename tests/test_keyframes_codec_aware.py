@@ -31,20 +31,25 @@ class _Cap:
     def get(self, prop):
         if prop == 6:
             return fourcc(self._fourcc)
-        return 10.0
-    def grab(self): return True
+        return 30.0                     # a 30 fps source, as CHI's cameras
+    def grab(self):
+        self._work()                    # OpenCV decodes a skipped frame too
+        return True
     def set(self, *_a): return True
     def isOpened(self): return True  # noqa: N802
     def release(self): self.released = True
     def interrupt(self): pass
 
-    def read(self):
-        if self.every_ms:
-            time.sleep(self.every_ms / 1000.0)
+    def _work(self):
         if self.burn_ms:
             t = time.thread_time()
             while (time.thread_time() - t) * 1000.0 < self.burn_ms:
                 pass
+
+    def read(self):
+        if self.every_ms:                   # network pacing: the camera delivers every N ms
+            time.sleep(self.every_ms / 1000.0)
+        self._work()
         return True, np.zeros((8, 2592, 3), np.uint8)
 
 
@@ -55,7 +60,7 @@ def _run(codec, burn_ms=20.0, every_ms=0.0, seconds=1.2, **kw):
         cap = _Cap(codec, keyframes_only=keyframes_only, burn_ms=burn_ms, every_ms=every_ms)
         opens.append(cap); return cap
     d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=30.0,
-                         keyframes_only_min_width=2000, **kw)
+                         keyframes_only_min_width=2000, cost_window_s=0.15, **kw)
     with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
         d.start()
         deadline = time.time() + seconds
@@ -83,7 +88,7 @@ class CodecAwareTests(unittest.TestCase):
         from cvti.serving import streams as st
         d = st.StreamDecoder("cam", "rtsp://x/y", keyframes_only_min_width=2000)
         d.source_width, d.codec = 2592, ""
-        d.decode_cpu_ms, d._full_decode_samples = 30.0, 20
+        d.decode_cpu_share, d._cost_windows = 0.9, 5
         self.assertTrue(d._wants_keyframes())
         d.codec = "mjpeg"
         self.assertFalse(d._wants_keyframes())
