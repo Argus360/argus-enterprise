@@ -466,7 +466,9 @@ class MultiStreamPipeline:
                  camera_dewarp: dict | None = None,
                  keyframe_decode: bool | None = None,
                  keyframe_min_width: int = 2000,
-                 detector_threads: int | None = None) -> None:
+                 detector_threads: int | None = None,
+                 keyframe_cost_ms: float = 15.0) -> None:
+        self.keyframe_cost_ms = float(keyframe_cost_ms)
         # Threads for the CPU detector session (cvti.detector.accel). None =
         # detector_threads_for(): one core kept free on a CPU-only box.
         self.detector_threads = detector_threads
@@ -597,12 +599,17 @@ class MultiStreamPipeline:
         # now viewer-aware: the smooth loop raises display_fps on exactly the
         # cameras with an open /stream connection and drops it when the last
         # viewer leaves. Smoother where eyes are, ~3x cheaper where none are.
-        keyframes = (self.keyframe_decode if self.keyframe_decode is not None
-                     else compute_device(self.device) == "cpu")
+        # Keyframe-only decode is decided per camera by MEASURED decode cost
+        # (streams.StreamDecoder.decode_cpu_ms), not by whether detection has
+        # a GPU: a GPU box can still decode on the CPU, and a hardware decoder
+        # makes a wide stream cheap (Tolu's audit, 15 Oct 2026). The site can
+        # still force it off or on.
+        keyframes = self.keyframe_decode if self.keyframe_decode is not None else True
         if keyframes:
-            log.info("[serving] CPU-only box: live streams %d px wide or more decode keyframes "
-                     "only (keyframe_decode / keyframe_min_width in the site file override)",
-                     self.keyframe_min_width)
+            log.info("[serving] live streams %d px wide or more switch to keyframe-only decode "
+                     "when a full-decode frame measures %.0f ms of CPU or more "
+                     "(keyframe_decode / keyframe_min_width / keyframe_cost_ms in the site file)",
+                     self.keyframe_min_width, self.keyframe_cost_ms)
         for cam_id, src in self.sources.items():
             vo = cam_id in self.view_only
             # A view-only camera decodes just enough to keep its link state
@@ -616,7 +623,8 @@ class MultiStreamPipeline:
                 dewarp=self.camera_dewarp.get(cam_id),
                 idle_when_unwatched=vo,
                 probe_source=self.fallback_sources.get(cam_id, src),
-                keyframes_only_min_width=(self.keyframe_min_width if keyframes else 0)).start()
+                keyframes_only_min_width=(self.keyframe_min_width if keyframes else 0),
+                keyframe_cost_ms=self.keyframe_cost_ms).start()
         if self.smooth_publish:
             import threading as _th
             self._smooth_thread = _th.Thread(target=self._smooth_publish_loop,
@@ -1524,6 +1532,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                keyframe_decode=(bool(site["keyframe_decode"])
                                                 if isinstance(site.get("keyframe_decode"), bool) else None),
                                keyframe_min_width=int(site.get("keyframe_min_width", 2000) or 2000),
+                               keyframe_cost_ms=float(site.get("keyframe_cost_ms", 15.0) or 15.0),
                                detector_threads=(int(site["detector_threads"])
                                                  if isinstance(site.get("detector_threads"), int)
                                                  and not isinstance(site.get("detector_threads"), bool)
