@@ -175,6 +175,9 @@ def _gate_workers_for(requested: int, n_cameras: int, *, provider: str = "",
 # 24 fps the pilot server decoded 288 frames a second of 5-megapixel HEVC
 # for display alone and sat at 100% CPU (bundle, 13 Oct 2026 22:37).
 CPU_WALL_DECODE_BUDGET_FPS = 96
+# The static per-camera ceiling keeps a floor so a tile is never asked for
+# less than this by the CEILING; the per-tick budget in wall_budget.py may
+# take a watched camera lower when its measured decode cost demands it.
 WALL_FPS_FLOOR = 8.0
 
 
@@ -467,11 +470,15 @@ class MultiStreamPipeline:
                  keyframe_decode: bool | None = None,
                  keyframe_min_width: int = 2000,
                  detector_threads: int | None = None,
-                 keyframe_cost_share: float = 0.25) -> None:
+                 keyframe_cost_share: float = 0.25,
+                 wall_decode_budget_ms: float | None = None) -> None:
         # CPU share of one core, measured over fixed windows, above which an
         # eligible stream switches to keyframe-only decode under the "auto"
         # policy (see StreamDecoder).
         self.keyframe_cost_share = float(keyframe_cost_share)
+        # Decode milliseconds per second the wall may spend, shared by watched
+        # cameras after the detection baseline (cvti.serving.wall_budget).
+        self.wall_decode_budget_ms = wall_decode_budget_ms
         # Threads for the CPU detector session (cvti.detector.accel). None =
         # detector_threads_for(): one core kept free on a CPU-only box.
         self.detector_threads = detector_threads
@@ -720,15 +727,34 @@ class MultiStreamPipeline:
         nothing. Legacy smooth boxes lag by sampling AND processing latency;
         opted-in exact-frame cameras instead publish from the inference path
         while any annotated viewer is connected."""
+        from cvti.serving.wall_budget import WALL_DECODE_BUDGET_MS, WallCamera, allocate_wall_fps
         last_seq: dict = {}
         period = 1.0 / self.publish_fps
+        # getattr: tests build pipelines raw, without __init__.
+        cpu_only = compute_device(getattr(self, "device", "") or "cpu") == "cpu"
+        budget_ms = getattr(self, "wall_decode_budget_ms", None) or WALL_DECODE_BUDGET_MS
         while True:
             t0 = time.perf_counter()
+            # Boost decode only for cameras actually watched, and on a
+            # CPU-only box share a decode budget among them by measured cost
+            # (Tolu's audit, 15 Oct 2026: a fixed per-camera floor is not a
+            # budget). Allocated once per tick for every camera.
+            try:
+                rates = allocate_wall_fps(
+                    [WallCamera(cam_id, self.publisher.has_viewers(cam_id),
+                                getattr(d, "_busy_ms", None),
+                                getattr(d, "source_width", 0) or getattr(d, "stream_width", 0),
+                                getattr(d, "source_height", 0) or getattr(d, "stream_height", 0),
+                                bool(getattr(d, "_cap_keyframes", False)))
+                     for cam_id, d in list(self._decoders.items())],
+                    ceiling_fps=self.publish_fps, cpu_only=cpu_only, budget_ms=budget_ms)
+            except Exception:  # noqa: BLE001 - the wall must keep publishing
+                log.debug("wall budget allocation failed; keeping last rates", exc_info=True)
+                rates = {}
             for cam_id, d in list(self._decoders.items()):
                 try:
-                    # Boost decode only while this camera is actually watched.
-                    d.display_fps = (self.publish_fps
-                                     if self.publisher.has_viewers(cam_id) else 0.0)
+                    if cam_id in rates:
+                        d.display_fps = rates[cam_id]
                     if self._synchronized_boxes(cam_id):
                         # Do not paint stale coordinates onto newer video.
                         # Frames with boxes are published by _route_to_queue.
@@ -1545,7 +1571,11 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                detector_threads=(int(site["detector_threads"])
                                                  if isinstance(site.get("detector_threads"), int)
                                                  and not isinstance(site.get("detector_threads"), bool)
-                                                 and site["detector_threads"] > 0 else None))
+                                                 and site["detector_threads"] > 0 else None),
+                               wall_decode_budget_ms=(float(site["wall_decode_budget_ms"])
+                                                      if isinstance(site.get("wall_decode_budget_ms"), (int, float))
+                                                      and not isinstance(site.get("wall_decode_budget_ms"), bool)
+                                                      and site["wall_decode_budget_ms"] > 0 else None))
 
     def _fast_path(alert) -> None:
         """Two-tier alerting (EP-06-T4): criticals are shown provisionally the
