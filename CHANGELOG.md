@@ -4,6 +4,21 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## [Unreleased]
+
+**The camera preview avoids processing discarded pixel frames.** On verified
+FFmpeg MJPEG sources it samples compressed images before decoding. H.264 and
+HEVC keep decoding reference frames, but only convert and retrieve pixels
+when a preview frame is due. Files, webcams, and unknown codecs keep their
+existing capture path; unsupported optimized modes reopen through that path.
+Source resolution, retained snapshots, and the eight-fps preview target are
+preserved. Synthetic 1080p30 software-decode fixtures on a four-logical-CPU
+Windows host measured median preview-process CPU reductions of 75% (MJPEG),
+31% (H.264), and 23% (HEVC), with three alternating 60-second runs per variant
+and codec. A four-camera MJPEG/H.264/HEVC/H.264 mix used 19% less CPU at the
+median and maintained higher display rates, also measured over three runs
+per variant. These are isolated preview measurements, not customer capacity claims.
+
 ## v1.10.9 — 14 Oct 2026
 
 **A computer with a graphics card is treated as one.** The installed app

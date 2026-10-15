@@ -56,7 +56,9 @@ class LiveWall:
         with self._lock:
             rec = self._diagnostics.setdefault(cam_id, {"started_at": time.time(),
                 "open_attempts": 0, "decoded_count": 0, "published_count": 0,
-                "read_failures": 0, "events": []})
+                "read_failures": 0, "events": [], "grabbed_packets_or_frames": 0,
+                "retrieved_images": 0, "skipped_materializations": 0,
+                "mjpeg_image_decodes": 0})
             if state is not None and state != rec.get("state"):
                 rec["events"] = (rec["events"] + [{"at": time.time(), "state": state}])[-20:]
                 rec["state"] = state
@@ -100,6 +102,52 @@ class LiveWall:
         from cvti.serving.capture import open_capture
         return open_capture(source)
 
+    def _count_capture(self, cam_id, **counts):
+        with self._lock:
+            rec = self._diagnostics[cam_id]
+            for key, value in counts.items():
+                rec[key] = rec.get(key, 0) + value
+
+    def _open_preview(self, cam_id, source, captures, optimize=True):
+        """Choose a preview strategy without changing the shared engine opener."""
+        cap = self._open_observed(cam_id, source)
+        captures[:] = [cap]
+        backend, codec, mode = "unknown", "unknown", "read"
+        try:
+            name = cap.getBackendName()
+            if isinstance(name, str):
+                backend = name
+            tag = cap.get(cv2.CAP_PROP_FOURCC)
+            if isinstance(tag, (int, float)) and tag > 0:
+                codec = "".join(chr((int(tag) >> (8 * i)) & 255) for i in range(4))
+        except (AttributeError, ValueError, OverflowError, cv2.error):
+            pass  # Unknown backends keep the existing read() behavior.
+        with self._lock:
+            optimize = optimize and not self._diagnostics[cam_id].get("capture_fallback_reason")
+        if optimize and "://" in str(source) and backend == "FFMPEG":
+            if codec.lower() in {"mjpg", "jpeg"}:
+                try:
+                    # In raw mode grab() demuxes a compressed JPEG packet;
+                    # ordinary FFmpeg grab() still invokes the video decoder.
+                    raw = cap.set(cv2.CAP_PROP_FORMAT, -1)
+                    raw = raw and cap.get(cv2.CAP_PROP_FORMAT) == -1
+                except cv2.error:
+                    raw = False
+                if raw:
+                    mode = "mjpeg_packets"
+                else:
+                    # A rejected property can leave backend state uncertain.
+                    # Release before reopening; never overlap camera sessions.
+                    cap.release()
+                    self._record(cam_id, capture_fallback_reason="raw_mode_unavailable")
+                    return self._open_preview(cam_id, source, captures, optimize=False)
+            elif codec.lower() in {"h264", "avc1", "x264", "hevc", "h265", "hev1", "hvc1"}:
+                # Preserve reference-frame decoding; retrieve() is the costly
+                # pixel conversion/copy that only displayed frames need.
+                mode = "sampled_retrieve"
+        self._record(cam_id, capture_backend=backend, source_codec=codec, capture_mode=mode)
+        return cap, mode
+
     def _decode(self, cam_id: str, source) -> None:
         captures = []
         try:
@@ -113,8 +161,8 @@ class LiveWall:
                 cap.release()
 
     def _decode_frames(self, cam_id: str, source, captures) -> None:
-        cap = self._open_observed(cam_id, source)
-        captures.append(cap)
+        optimization_disabled = False
+        cap, mode = self._open_preview(cam_id, source, captures)
         src = str(source)
         is_net = "://" in src                     # RTSP/HTTP camera, not a clip
         is_file = not (isinstance(source, int) or src.isdigit() or is_net)
@@ -124,9 +172,50 @@ class LiveWall:
         n = 0
         dead_since = 0.0
         while not self._stop.is_set():
+            sampled_at = None
             started = time.perf_counter()
-            ok, frame = cap.read()
-            self._timed(cam_id, "read", started)
+            if mode == "read":
+                ok, frame = cap.read()
+                self._timed(cam_id, "read", started)
+                if ok:
+                    self._count_capture(cam_id, retrieved_images=1)
+            else:
+                try:
+                    ok = cap.grab()
+                except cv2.error:
+                    ok = False
+                    optimization_disabled = True
+                    self._record(cam_id, capture_fallback_reason="grab_unsupported")
+                self._timed(cam_id, "grab", started)
+                if ok:
+                    self._count_capture(cam_id, grabbed_packets_or_frames=1)
+                    self._record(cam_id, last_capture_at=time.time())
+                    sampled_at = time.monotonic()
+                    if sampled_at < next_publish_at:
+                        self._count_capture(cam_id, skipped_materializations=1)
+                        continue
+                    started = time.perf_counter()
+                    try:
+                        ok, frame = cap.retrieve()
+                        if ok and mode == "mjpeg_packets":
+                            frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+                            ok = frame is not None
+                            if ok:
+                                self._count_capture(cam_id, mjpeg_image_decodes=1)
+                        ok = ok and frame is not None
+                    except cv2.error:
+                        ok = False
+                    self._timed(cam_id, "retrieve", started)
+                    if ok:
+                        self._count_capture(cam_id, retrieved_images=1)
+                    else:
+                        optimization_disabled = True
+                        self._record(cam_id, capture_fallback_reason="image_retrieval_failed")
+                if optimization_disabled:
+                    cap.release()
+                    cap, mode = self._open_preview(cam_id, source, captures, optimize=False)
+                    first_frame_at = None
+                    continue
             if not ok:
                 if is_file:                       # loop the clip so it plays continuously
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -148,8 +237,8 @@ class LiveWall:
                             cap.release()
                         except Exception:  # noqa: BLE001
                             log.debug("releasing the dead capture failed", exc_info=True)
-                        cap = self._open_observed(cam_id, source)
-                        captures[:] = [cap]
+                        cap, mode = self._open_preview(
+                            cam_id, source, captures, optimize=not optimization_disabled)
                         first_frame_at = None
                         dead_since = time.time()
                     self._stop.wait(0.3)
@@ -163,7 +252,9 @@ class LiveWall:
                 if "first_decoded_at" not in rec:
                     rec["first_decoded_at"] = observed
                     rec["first_decode_delay_s"] = round(observed - rec["started_at"], 3)
-            now = time.monotonic()
+            # Start the interval at capture, not after conversion: otherwise
+            # conversion time silently lowers the requested preview cadence.
+            now = sampled_at if sampled_at is not None else time.monotonic()
             if is_webcam:
                 # First USB/AVFoundation frames can be almost black while auto
                 # exposure settles. Drain at capture speed before publishing.
