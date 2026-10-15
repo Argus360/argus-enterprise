@@ -377,6 +377,7 @@ class StreamDecoder:
             "keyframe_policy": getattr(self, "keyframe_policy", "auto"),
             "frame_cpu_ms": (round(self.frame_cpu_ms, 1)
                              if getattr(self, "frame_cpu_ms", None) is not None else None),
+            "wall_fps": round(float(getattr(self, "display_fps", 0.0) or 0.0), 1),
             "source_width": getattr(self, "source_width", 0),      # tests build decoders raw
             "source_height": getattr(self, "source_height", 0),
             "source_fps": round(self._fps, 1),
