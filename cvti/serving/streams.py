@@ -160,23 +160,45 @@ class StreamDecoder:
                  idle_when_unwatched: bool = False,
                  probe_source: int | str | None = None,
                  keyframes_only_min_width: int = 0,
-                 keyframe_cost_ms: float = 15.0) -> None:
+                 keyframe_policy: str = "auto",
+                 keyframe_cost_share: float = 0.25,
+                 cost_window_s: float = 2.0) -> None:
         self.camera_id = camera_id
         self.source = source
-        # What decoding one frame of this stream costs THIS machine, in CPU
-        # time on the decode thread (time.thread_time), not wall time: at the
-        # live edge a read waits for the camera, so wall time says 40 ms for
-        # a 25 fps camera on an idle box. CPU time says 2-5 ms for hardware
-        # decode and 30-50 ms for software decode of a 5-megapixel HEVC frame.
-        # Keyframe-only decode is chosen by this measurement, not by whether
-        # the detector has a GPU (Tolu's audit, 15 Oct 2026): a GPU box can
-        # still decode on the CPU, and a hardware decoder can make a wide
-        # stream cheap. decode_cpu_ms covers grab+read; frame_cpu_ms adds
-        # the dewarp, which is what the wall's decode budget should see.
-        self.keyframe_cost_ms = float(keyframe_cost_ms)
-        self.decode_cpu_ms: float | None = None    # EWMA, full-decode frames only
-        self.frame_cpu_ms: float | None = None     # EWMA, decode + dewarp
-        self._full_decode_samples = 0
+        # What decoding this stream costs THIS machine, in CPU time on the
+        # decode thread (time.thread_time), not wall time: at the live edge a
+        # read waits for the camera, so wall time says 40 ms for a 25 fps
+        # camera on an idle box. Keyframe-only decode is chosen by this
+        # measurement, not by whether the detector has a GPU (Tolu's audit,
+        # 15 Oct 2026): a GPU box can still decode on the CPU, and a hardware
+        # decoder makes a wide stream cheap.
+        #
+        # Two numbers, both independent of OUR sampling rate (Tolu's review:
+        # timing a whole stride made a 4 ms camera look like 32 ms when
+        # detection dropped from 30 to 4 fps, because OpenCV decodes every
+        # skipped frame too):
+        #   decode_cpu_ms     CPU per SOURCE frame decoded (stride grabs + read,
+        #                     divided by the frames that iteration consumed)
+        #   decode_cpu_share  CPU consumed by decoding this stream per wall
+        #                     second, measured over cost_window_s windows:
+        #                     0.25 = a quarter of one core. This is what the
+        #                     keyframe decision uses.
+        # frame_cpu_ms adds the dewarp; it is per KEPT frame, which is what
+        # the wall's decode budget pays per displayed frame.
+        policy = str(keyframe_policy or "auto").lower()
+        if policy not in ("auto", "force", "off"):
+            raise ValueError(f"keyframe_policy must be auto, force or off, not {keyframe_policy!r}")
+        self.keyframe_policy = policy
+        self.keyframe_cost_share = float(keyframe_cost_share)
+        self.cost_window_s = float(cost_window_s)
+        self.decode_cpu_ms: float | None = None    # EWMA, per source frame, full decode only
+        self.decode_cpu_share: float | None = None # EWMA over windows, full decode only
+        self.frame_cpu_ms: float | None = None     # EWMA, decode + dewarp, per kept frame
+        self._cost_windows = 0                     # completed windows since (re)measurement
+        self._window_cpu_s = 0.0
+        self._window_wall_s = 0.0
+        self._window_frames = 0
+        self._window_started_at = 0.0
         # Keyframe-only decode (capture.FFmpegKeyframeCapture) for a live
         # stream at least this wide; 0 = never. The first open is a normal
         # one, which tells us the width; a stream that qualifies is reopened
@@ -350,6 +372,9 @@ class StreamDecoder:
             "width": self.stream_width, "height": self.stream_height,
             "decode_cpu_ms": (round(self.decode_cpu_ms, 1)
                               if getattr(self, "decode_cpu_ms", None) is not None else None),
+            "decode_cpu_share": (round(self.decode_cpu_share, 3)
+                                 if getattr(self, "decode_cpu_share", None) is not None else None),
+            "keyframe_policy": getattr(self, "keyframe_policy", "auto"),
             "frame_cpu_ms": (round(self.frame_cpu_ms, 1)
                              if getattr(self, "frame_cpu_ms", None) is not None else None),
             "source_width": getattr(self, "source_width", 0),      # tests build decoders raw
@@ -462,21 +487,62 @@ class StreamDecoder:
         self._thread.start()
         return self
 
-    KEYFRAME_DECISION_SAMPLES = 10
+    KEYFRAME_DECISION_WINDOWS = 2
 
     def _wants_keyframes(self) -> bool:
-        """Keyframe-only decode for a live stream that is wide enough AND
-        whose full decode has measured expensive on this machine. Once
-        chosen it sticks (the measurement is not repeated in keyframe mode)
-        until the source changes size, when it is measured again."""
+        """Keyframe-only decode for a live stream that is wide enough and,
+        under the "auto" policy, whose full decode has measured expensive on
+        this machine over KEYFRAME_DECISION_WINDOWS windows. "force" switches
+        every eligible stream without measuring; "off" never switches. Once
+        chosen it sticks (nothing is measured in keyframe mode) until the
+        source changes size, when it is measured again."""
+        if self.keyframe_policy == "off":
+            return False
         if not (self.keyframes_only_min_width > 0 and self._is_live()
                 and self.source_width >= self.keyframes_only_min_width):
             return False
-        if self._cap_keyframes:
+        if self._cap_keyframes or self.keyframe_policy == "force":
             return True
-        return (self._full_decode_samples >= self.KEYFRAME_DECISION_SAMPLES
-                and self.decode_cpu_ms is not None
-                and self.decode_cpu_ms >= self.keyframe_cost_ms)
+        return (self._cost_windows >= self.KEYFRAME_DECISION_WINDOWS
+                and self.decode_cpu_share is not None
+                and self.decode_cpu_share >= self.keyframe_cost_share)
+
+    def _observe_decode_cost(self, cpu_s: float, wall_s: float, source_frames: int) -> None:
+        """Account one full-decode iteration: `source_frames` frames went
+        through the decoder (stride grabs + the read) in cpu_s of CPU and
+        wall_s of wall time (grabs + read only; the pacing sleep is not
+        included). The share is CPU per second OF STREAM: per-source-frame
+        cost times the source frame rate when the capture reports one, so
+        neither our stride nor our pacing sleep can move it; without a
+        reported rate it falls back to CPU over decode wall time. Windows
+        close on real elapsed time, so a slowly paced loop still decides."""
+        per_frame_ms = cpu_s * 1000.0 / max(1, source_frames)
+        self.decode_cpu_ms = (per_frame_ms if self.decode_cpu_ms is None
+                              else 0.2 * per_frame_ms + 0.8 * self.decode_cpu_ms)
+        now = time.perf_counter()
+        if not self._window_started_at:
+            self._window_started_at = now
+        self._window_cpu_s += cpu_s
+        self._window_wall_s += wall_s
+        self._window_frames += max(1, source_frames)
+        if now - self._window_started_at >= self.cost_window_s:
+            if self._fps > 1e-3:
+                share = (self._window_cpu_s / self._window_frames) * self._fps
+            else:
+                share = self._window_cpu_s / max(1e-6, self._window_wall_s)
+            self.decode_cpu_share = (share if self.decode_cpu_share is None
+                                     else 0.5 * share + 0.5 * self.decode_cpu_share)
+            self._cost_windows += 1
+            self._window_cpu_s = self._window_wall_s = 0.0
+            self._window_frames = 0
+            self._window_started_at = now
+
+    def _reset_decode_cost(self) -> None:
+        self.decode_cpu_ms = self.decode_cpu_share = None
+        self._cost_windows = 0
+        self._window_cpu_s = self._window_wall_s = 0.0
+        self._window_frames = 0
+        self._window_started_at = 0.0
 
     def _open(self):
         # One capture path for every platform (cvti/serving/capture.py): the
@@ -552,19 +618,16 @@ class StreamDecoder:
             if ok:
                 ok, image = cap.read()
                 orig_index += 1
-            if ok:
-                decode_cpu = (time.thread_time() - cpu_start) * 1000.0
-                if not self._cap_keyframes:
-                    self.decode_cpu_ms = (decode_cpu if self.decode_cpu_ms is None
-                                          else 0.2 * decode_cpu + 0.8 * self.decode_cpu_ms)
-                    self._full_decode_samples += 1
+            if ok and not self._cap_keyframes:
+                self._observe_decode_cost(time.thread_time() - cpu_start,
+                                          time.perf_counter() - loop_start, stride)
             if ok and not self.source_width:
                 self.source_height, self.source_width = image.shape[:2]
             elif ok and (self.source_width, self.source_height) != tuple(image.shape[1::-1]) \
                     and not self._cap_keyframes:
                 # The camera was moved to another stream size: measure again.
                 self.source_height, self.source_width = image.shape[:2]
-                self.decode_cpu_ms, self._full_decode_samples = None, 0
+                self._reset_decode_cost()
             if ok and self.dewarp is not None:
                 try:
                     image = self.dewarp.apply(image)

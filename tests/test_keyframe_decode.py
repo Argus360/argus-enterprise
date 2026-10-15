@@ -74,20 +74,26 @@ class _Cap:
         self.burn_ms = burn_ms        # CPU spent per read, like software decode
         self.wait_ms = wait_ms        # wall time spent waiting, like a live camera
 
-    def get(self, *_a): return 10.0
-    def grab(self): return True
+    def get(self, *_a): return 30.0
     def set(self, *_a): return True
     def isOpened(self): return True  # noqa: N802
     def release(self): self.released = True
     def interrupt(self): self.interrupted = True
 
-    def read(self):
+    def _work(self):
         if self.wait_ms:
             time.sleep(self.wait_ms / 1000.0)
         if self.burn_ms:
             t = time.thread_time()
             while (time.thread_time() - t) * 1000.0 < self.burn_ms:
                 pass
+
+    def grab(self):
+        self._work()                   # OpenCV decodes a skipped frame too
+        return True
+
+    def read(self):
+        self._work()
         return True, np.zeros((8, self.width, 3), np.uint8)
 
 
@@ -100,7 +106,7 @@ class DecoderPolicyTests(unittest.TestCase):
             opens.append(cap)
             return cap
         d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=30.0,
-                             keyframes_only_min_width=min_width)
+                             keyframes_only_min_width=min_width, cost_window_s=0.15)
         with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
             d.start()
             deadline = time.time() + 4.0
@@ -114,7 +120,7 @@ class DecoderPolicyTests(unittest.TestCase):
         d, opens = self._run(width=2592, min_width=2000, burn_ms=20.0)
         self.assertGreaterEqual(len(opens), 2)
         self.assertFalse(opens[0].keyframes_only, "the first open measures in full decode")
-        self.assertGreaterEqual(d.decode_cpu_ms, 15.0)
+        self.assertGreaterEqual(d.decode_cpu_share, 0.25)
         self.assertTrue(opens[1].keyframes_only)
         self.assertTrue(opens[0].released)
         self.assertEqual(d.link_status()["decode"], "keyframes")
@@ -138,18 +144,19 @@ class DecoderPolicyTests(unittest.TestCase):
             opens.append(keyframes_only)
             return _Cap(2592, keyframes_only=False, burn_ms=20.0)   # ffmpeg missing: full decode back
         d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=30.0,
-                             keyframes_only_min_width=2000)
+                             keyframes_only_min_width=2000, cost_window_s=0.15)
         with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
-            d.start(); time.sleep(0.6); d.stop()
+            d.start(); time.sleep(1.2); d.stop()
         self.assertEqual(opens[:2], [False, True])
         self.assertEqual(len(opens), 2, "after one refusal the decoder stops asking")
 
     def test_the_pipeline_turns_it_on_for_cpu_boxes_and_the_site_can_override(self):
         from cvti.serving import pipeline
         src = inspect.getsource(pipeline.MultiStreamPipeline.start)
-        self.assertIn("keyframe_decode if self.keyframe_decode is not None else True", src)
-        self.assertIn("keyframes_only_min_width=(self.keyframe_min_width if keyframes else 0)", src)
+        self.assertIn('"auto" if self.keyframe_decode is None', src)
+        self.assertIn('keyframes_only_min_width=(self.keyframe_min_width if policy != "off" else 0)', src)
         self.assertIn('keyframe_decode=(bool(site["keyframe_decode"])', inspect.getsource(pipeline.run_site))
+        self.assertIn('keyframe_cost_share=float(site.get("keyframe_cost_share", 0.25) or 0.25)', inspect.getsource(pipeline.run_site))
 
 
 if __name__ == "__main__":
@@ -167,7 +174,7 @@ class SourceWidthTests(unittest.TestCase):
         def fake_open(source, keyframes_only=False, **_kw):
             cap = _Cap(2592, keyframes_only=keyframes_only, burn_ms=20.0); opens.append(cap); return cap
         d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=30.0,
-                             keyframes_only_min_width=2000,
+                             keyframes_only_min_width=2000, cost_window_s=0.15,
                              dewarp=Dewarp.from_config({"mode": "panorama", "output": [1600, 500]}))
         with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
             d.start()
@@ -254,7 +261,7 @@ class MeasuredCostTests(unittest.TestCase):
         self.assertEqual(len(opens), 1, "a cheap decode never switches, however wide")
         self.assertFalse(opens[0].keyframes_only)
         self.assertIsNotNone(d.decode_cpu_ms)
-        self.assertLess(d.decode_cpu_ms, 15.0)
+        self.assertLess(d.decode_cpu_share or 0.0, 0.25)
         self.assertEqual(d.link_status()["decode"], "full")
         self.assertIn("decode_cpu_ms", d.ingest_status())
         self.assertIn("frame_cpu_ms", d.ingest_status())
@@ -265,13 +272,78 @@ class MeasuredCostTests(unittest.TestCase):
         def fake_open(source, keyframes_only=False, **_kw):
             cap = _Cap(2592, keyframes_only=keyframes_only, burn_ms=20.0); opens.append(cap); return cap
         d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=30.0,
-                             keyframes_only_min_width=2000, keyframe_cost_ms=200.0)
+                             keyframes_only_min_width=2000, keyframe_cost_share=5.0,
+                             cost_window_s=0.15)
         with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
             d.start(); time.sleep(0.8); d.stop()
-        self.assertEqual(len(opens), 1, "20 ms a frame is under a 200 ms threshold")
+        self.assertEqual(len(opens), 1, "the measured share is under a five-core threshold")
 
     def test_the_pipeline_passes_the_threshold_from_the_site(self):
         from cvti.serving import pipeline
-        self.assertIn('keyframe_cost_ms=float(site.get("keyframe_cost_ms", 15.0) or 15.0)',
+        self.assertIn('keyframe_cost_share=float(site.get("keyframe_cost_share", 0.25) or 0.25)',
                       inspect.getsource(pipeline.run_site))
-        self.assertIn("keyframe_cost_ms=self.keyframe_cost_ms", inspect.getsource(pipeline.MultiStreamPipeline.start))
+        self.assertIn("keyframe_cost_share=self.keyframe_cost_share", inspect.getsource(pipeline.MultiStreamPipeline.start))
+
+
+class SamplingIndependenceTests(unittest.TestCase):
+    """Review of #244: timing a whole stride made a 4 ms camera look like
+    32 ms when detection dropped from 30 to 4 fps. The verdict must not
+    depend on our sampling rate; the fake capture burns CPU in grab() too."""
+
+    def _share_at(self, target_fps, burn_ms):
+        from cvti.serving import streams as st
+        opens = []
+        def fake_open(source, keyframes_only=False, **_kw):
+            cap = _Cap(2592, keyframes_only=keyframes_only, burn_ms=burn_ms); opens.append(cap); return cap
+        d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=target_fps,
+                             keyframes_only_min_width=2000, cost_window_s=0.15)
+        with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
+            d.start(); time.sleep(1.2); d.stop()
+        return d, opens
+
+    def test_a_cheap_camera_stays_on_full_decode_at_any_sampling_rate(self):
+        # 30 fps source at ~1 ms of CPU a frame: a few percent of a core,
+        # whether we keep every frame or one in eight.
+        for target in (30.0, 4.0):
+            d, opens = self._share_at(target_fps=target, burn_ms=1.0)
+            self.assertEqual(len(opens), 1, f"target {target}: switched on a cheap camera")
+            self.assertLess(d.decode_cpu_share or 0.0, 0.25)
+            self.assertLess(d.decode_cpu_ms, 3.0, "cost is per SOURCE frame, not per stride")
+
+    def test_an_expensive_camera_switches_at_any_sampling_rate(self):
+        for target in (30.0, 4.0):
+            d, opens = self._share_at(target_fps=target, burn_ms=20.0)
+            self.assertGreaterEqual(len(opens), 2, f"target {target}: an expensive camera must switch")
+
+
+class PolicyTests(unittest.TestCase):
+    def _run(self, policy, burn_ms):
+        from cvti.serving import streams as st
+        opens = []
+        def fake_open(source, keyframes_only=False, **_kw):
+            cap = _Cap(2592, keyframes_only=keyframes_only, burn_ms=burn_ms); opens.append(cap); return cap
+        d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=30.0,
+                             keyframes_only_min_width=2000, keyframe_policy=policy, cost_window_s=0.15)
+        with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
+            d.start(); time.sleep(0.8); d.stop()
+        return opens
+
+    def test_force_switches_a_cheap_wide_stream_without_measuring(self):
+        opens = self._run("force", burn_ms=0.0)
+        self.assertGreaterEqual(len(opens), 2)
+        self.assertTrue(opens[1].keyframes_only)
+
+    def test_off_never_switches_an_expensive_stream(self):
+        opens = self._run("off", burn_ms=20.0)
+        self.assertEqual(len(opens), 1)
+
+    def test_an_unknown_policy_is_rejected(self):
+        from cvti.serving import streams as st
+        with self.assertRaises(ValueError):
+            st.StreamDecoder("cam", "rtsp://x/y", keyframe_policy="maybe")
+
+    def test_the_pipeline_maps_the_site_setting_to_three_policies(self):
+        from cvti.serving import pipeline
+        src = inspect.getsource(pipeline.MultiStreamPipeline.start)
+        self.assertIn('"force" if self.keyframe_decode else "off"', src)
+        self.assertIn("keyframe_policy=policy", src)
