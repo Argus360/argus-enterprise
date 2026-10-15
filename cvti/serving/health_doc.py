@@ -24,10 +24,24 @@ CRITICAL = "critical"
 
 
 def derive_status(*, cameras: list, gate: dict, disk: dict, memory: dict,
-                  components: dict, scene_mapping: list | None = None) -> tuple:
+                  components: dict, scene_mapping: list | None = None,
+                  engine: dict | None = None) -> tuple:
     """(status, reasons). The reasons are the point — a bare 'degraded' with no
     'why' just moves the 3am question one hop along."""
     reasons = []
+
+    wall = (engine or {}).get("wall_budget") or {}
+    if wall and float(wall.get("over_budget_ms") or 0) > 0:
+        # The wall's decode budget does not fit (Tolu's review, 15 Oct 2026):
+        # say whether detection alone is the reason, and what to change.
+        reserved, budget = float(wall.get("reserved_ms") or 0), float(wall.get("budget_ms") or 0)
+        detail = (f"detection alone needs {reserved:.0f} of {budget:.0f} ms/s"
+                  if reserved > budget else
+                  f"{wall.get('watched', 0)} watched tiles at their minimum rate exceed the "
+                  f"{budget:.0f} ms/s left after detection")
+        reasons.append((DEGRADED, f"wall decode budget exceeded by {float(wall['over_budget_ms']):.0f} ms/s: "
+                                  f"{detail} — fewer analysed cameras, a lower target_fps, "
+                                  f"substreams, or a higher wall_decode_budget_ms"))
 
     for cam in cameras or []:
         if cam.get("state") == "offline":
@@ -100,7 +114,7 @@ def build_health_doc(*, started_at: float, cameras: list, gate: dict, disk: dict
     now = now if now is not None else time.time()
     status, reasons = derive_status(cameras=cameras, gate=gate, disk=disk,
                                     memory=memory, components=components,
-                                    scene_mapping=scene_mapping)
+                                    scene_mapping=scene_mapping, engine=engine)
     # Every heartbeat says which build wrote it: support triage starts with
     # "which version are you on?", and the honest answer is what the ENGINE
     # is running, not what the console's sidebar shows.
