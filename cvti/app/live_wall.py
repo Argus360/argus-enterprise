@@ -155,12 +155,6 @@ class LiveWall:
                     self._stop.wait(0.3)
                     continue
             dead_since = 0.0
-            dewarp = self._dewarp.get(cam_id)
-            if dewarp is not None:
-                try:
-                    frame = dewarp.apply(frame)
-                except Exception:  # noqa: BLE001 - a bad frame must not stop the preview
-                    log.debug("preview dewarp failed on a frame", exc_info=True)
             observed = time.time()
             self._record(cam_id, "receiving", last_decoded_at=observed, failure=None)
             with self._lock:
@@ -184,6 +178,19 @@ class LiveWall:
             if not is_file and now < next_publish_at:
                 continue
             next_publish_at = now + self.interval
+            # Dewarp only the frames that will be published. It used to run
+            # before this gate, so seven of every eight corrected frames on
+            # a 30 fps fisheye were thrown away unseen (Tolu's audit, 15 Oct
+            # 2026). The retained snapshot below is taken after it, so the
+            # zone editor still draws on the same geometry the engine sees.
+            dewarp = self._dewarp.get(cam_id)
+            if dewarp is not None:
+                started = time.perf_counter()
+                try:
+                    frame = dewarp.apply(frame)
+                except Exception:  # noqa: BLE001 - a bad frame must not stop the preview
+                    log.debug("preview dewarp failed on a frame", exc_info=True)
+                self._timed(cam_id, "dewarp", started)
             if self.retain_snapshot:
                 with self._lock:
                     self._raw[cam_id] = frame.copy()
