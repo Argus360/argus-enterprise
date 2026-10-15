@@ -207,3 +207,42 @@ class FramePathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreviewDewarpAfterGateTests(unittest.TestCase):
+    """The preview dewarps only the frames it publishes (Tolu's audit, 15 Oct
+    2026): before, every decoded frame of a 30 fps fisheye paid for the remap
+    and seven of eight were discarded by the 8 fps publish gate."""
+
+    def test_frames_discarded_by_the_publish_gate_are_not_dewarped(self):
+        from cvti.app.live_wall import LiveWall
+        from cvti.serving import dewarp as dw_mod
+
+        class CountingDewarp(dw_mod.Dewarp):
+            calls = 0
+            def apply(self, frame):
+                CountingDewarp.calls += 1
+                return super().apply(frame)
+
+        class FastCap:
+            def read(self): return True, fisheye_frame()
+            def get(self, *_a): return 30.0
+            def set(self, *_a): return True
+            def release(self): pass
+
+        wall = LiveWall([{"id": "cam", "source": "rtsp://fake/cam"}], width=960, fps=8,
+                        quality=65, retain_snapshot=True)
+        wall._dewarp["cam"] = CountingDewarp("panorama", output=(720, 240))
+        with mock.patch.object(LiveWall, "_open", return_value=FastCap()):
+            wall.start()
+            time.sleep(1.2)
+            wall.stop()
+        decoded = wall.diagnostics()["cam"]["decoded_count"]
+        published = wall.diagnostics()["cam"]["published_count"]
+        self.assertGreater(decoded, 3 * CountingDewarp.calls,
+                           f"decoded {decoded} frames but dewarped {CountingDewarp.calls}: the gate is not saving work")
+        self.assertLessEqual(CountingDewarp.calls, published + 1)
+        self.assertGreaterEqual(published, 3)
+        snap = wall.snapshot("cam")
+        self.assertEqual((snap["w"], snap["h"]), (720, 240), "the retained snapshot is still dewarped")
+        self.assertIn("dewarp", wall.diagnostics()["cam"]["stage_wall_times"])
