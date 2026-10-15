@@ -49,6 +49,18 @@ def derive_status(*, cameras: list, gate: dict, disk: dict, memory: dict,
                                       f"{cam.get('time_in_state', 0):.0f}s"))
         elif cam.get("state") == "reconnecting":
             reasons.append((DEGRADED, f"camera {cam.get('camera_id')} reconnecting"))
+        ingest_row = cam.get("ingest") or {}
+        if cam.get("decode") == "keyframes" and ingest_row.get("achieved_fps") is not None \
+                and ingest_row["achieved_fps"] < float(ingest_row.get("keyframe_min_fps") or 0.5):
+            # One frame per GOP is all detection gets on this camera; below
+            # this rate a two-second gate crossing can fall between frames
+            # (Tolu's audit, 15 Oct 2026). Name the fix.
+            rate = float(ingest_row["achieved_fps"])
+            reasons.append((DEGRADED,
+                            f"camera {cam.get('camera_id')} decodes keyframes only, about "
+                            f"{rate:.2f}/s (one every {1.0 / max(rate, 1e-6):.1f}s): short events "
+                            f"may be missed. Set detect_source to its substream or shorten the "
+                            f"camera's I-frame interval."))
         ingest = cam.get("ingest") or {}
         if ingest.get("limited"):
             # Adaptive ingest (3 Sep): the machine, not the camera, is the

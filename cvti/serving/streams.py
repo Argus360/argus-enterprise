@@ -163,7 +163,8 @@ class StreamDecoder:
                  keyframe_policy: str = "auto",
                  keyframe_cost_share: float = 0.25,
                  cost_window_s: float = 2.0,
-                 playout_idle_period: float = 2.0) -> None:
+                 playout_idle_period: float = 2.0,
+                 keyframe_min_fps: float = 0.5) -> None:
         self.camera_id = camera_id
         self.source = source
         # What decoding this stream costs THIS machine, in CPU time on the
@@ -212,6 +213,17 @@ class StreamDecoder:
         self.playout_idle_period = float(playout_idle_period)
         self.playout_skipped = 0
         self._last_idle_push = 0.0
+        # Codec awareness and the achieved rate (Tolu's audit, 15 Oct 2026).
+        # Keyframe-only decode only pays off on inter-frame codecs: on MJPEG
+        # every frame is a keyframe, so it would save nothing and is never
+        # chosen. In keyframe mode the rate detection actually gets is one
+        # frame per GOP; below keyframe_min_fps that can miss a two-second
+        # gate crossing, so health says so and names the fix (a detection
+        # substream, or a shorter I-frame interval on the camera).
+        self.codec = ""
+        self.keyframe_min_fps = float(keyframe_min_fps)
+        self.achieved_fps: float | None = None     # EWMA of delivered frames/s
+        self._sparse_warned = False
         # Keyframe-only decode (capture.FFmpegKeyframeCapture) for a live
         # stream at least this wide; 0 = never. The first open is a normal
         # one, which tells us the width; a stream that qualifies is reopened
@@ -383,6 +395,10 @@ class StreamDecoder:
     def ingest_status(self) -> dict:
         out = {
             "width": self.stream_width, "height": self.stream_height,
+            "codec": getattr(self, "codec", ""),
+            "achieved_fps": (round(self.achieved_fps, 2)
+                             if getattr(self, "achieved_fps", None) is not None else None),
+            "keyframe_min_fps": getattr(self, "keyframe_min_fps", 0.5),
             "decode_cpu_ms": (round(self.decode_cpu_ms, 1)
                               if getattr(self, "decode_cpu_ms", None) is not None else None),
             "decode_cpu_share": (round(self.decode_cpu_share, 3)
@@ -503,6 +519,27 @@ class StreamDecoder:
         return self
 
     KEYFRAME_DECISION_WINDOWS = 2
+    # Codecs where decoding only keyframes saves real work. MJPEG and raw
+    # formats are all keyframes already.
+    INTERFRAME_CODECS = frozenset({"h264", "avc1", "avc", "x264", "hevc", "hvc1", "hev1",
+                                   "h265", "x265", "av01", "av1", "vp9", "vp09", "vp8",
+                                   "mpeg4", "mp4v", "mpg4", "mpeg2video", "mpg2", "xvid"})
+
+    @staticmethod
+    def _codec_of(cap) -> str:
+        """The stream's codec as a short lowercase name, or "" if unknown."""
+        name = getattr(cap, "codec", "")
+        if name:
+            return str(name).lower()
+        try:
+            raw = int(cap.get(6))              # cv2.CAP_PROP_FOURCC, no cv2 import here
+        except Exception:  # noqa: BLE001 - a capture that cannot answer is "unknown"
+            return ""
+        if raw <= 0:
+            return ""
+        chars = [chr((raw >> (8 * i)) & 0xFF) for i in range(4)]
+        name = "".join(c for c in chars if 32 < ord(c) < 127).lower()
+        return name if len(name) >= 2 else ""    # a capture that answers nonsense is "unknown"
 
     def _wants_keyframes(self) -> bool:
         """Keyframe-only decode for a live stream that is wide enough and,
@@ -518,6 +555,8 @@ class StreamDecoder:
             return False
         if self._cap_keyframes or self.keyframe_policy == "force":
             return True
+        if self.codec and self.codec not in self.INTERFRAME_CODECS:
+            return False                       # MJPEG etc.: nothing to skip
         return (self._cost_windows >= self.KEYFRAME_DECISION_WINDOWS
                 and self.decode_cpu_share is not None
                 and self.decode_cpu_share >= self.keyframe_cost_share)
@@ -567,6 +606,9 @@ class StreamDecoder:
         cap = open_capture(self.source, keyframes_only=want)
         self._cap_keyframes = bool(getattr(cap, "keyframes_only", False))
         self._cap = cap
+        self.codec = self._codec_of(cap) or self.codec
+        self.achieved_fps = None               # a new capture: measure its rate afresh
+        self._sparse_warned = False
         if want and not self._cap_keyframes:
             # No ffmpeg or it refused: do not ask again for this stream.
             self.keyframes_only_min_width = 0
@@ -708,7 +750,22 @@ class StreamDecoder:
                 self.ended = True          # webcam exhausted / looping disabled
                 break
             attempt = 0                    # a healthy read resets the backoff
+            previous_frame_at = self.last_frame_at
             self.last_frame_at = time.time()
+            if previous_frame_at:
+                gap = self.last_frame_at - previous_frame_at
+                if 0.0 < gap < 60.0:
+                    rate = 1.0 / gap
+                    self.achieved_fps = (rate if self.achieved_fps is None
+                                         else 0.2 * rate + 0.8 * self.achieved_fps)
+                    if (self._cap_keyframes and not self._sparse_warned
+                            and self.achieved_fps < self.keyframe_min_fps):
+                        self._sparse_warned = True
+                        log.warning("[decode %s] keyframes arrive about every %.1fs (%.2f/s): "
+                                    "detection may miss short events. Give this camera a "
+                                    "detection substream (detect_source) or shorten its "
+                                    "I-frame interval.", self.camera_id,
+                                    1.0 / max(self.achieved_fps, 1e-6), self.achieved_fps)
             if self.state != CONNECTED:
                 # Recovery is announced, not silent — an operator who was told
                 # the camera went down has to be told it came back.
