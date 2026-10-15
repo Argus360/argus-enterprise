@@ -731,23 +731,28 @@ class MultiStreamPipeline:
         last_seq: dict = {}
         period = 1.0 / self.publish_fps
         # getattr: tests build pipelines raw, without __init__.
-        cpu_only = compute_device(getattr(self, "device", "") or "cpu") == "cpu"
         budget_ms = getattr(self, "wall_decode_budget_ms", None) or WALL_DECODE_BUDGET_MS
+        view_only = getattr(self, "view_only", set()) or set()
+        baseline = float(getattr(self, "target_fps", 0.0) or 0.0)
         while True:
             t0 = time.perf_counter()
-            # Boost decode only for cameras actually watched, and on a
-            # CPU-only box share a decode budget among them by measured cost
-            # (Tolu's audit, 15 Oct 2026: a fixed per-camera floor is not a
-            # budget). Allocated once per tick for every camera.
+            # Boost decode only for cameras actually watched, sharing a decode
+            # budget among them by MEASURED CPU cost after the detection
+            # baseline is reserved (Tolu's audit and review, 15 Oct 2026).
+            # Allocated once per tick for every camera; the accounting is
+            # kept for health.
             try:
-                rates = allocate_wall_fps(
+                allocation = allocate_wall_fps(
                     [WallCamera(cam_id, self.publisher.has_viewers(cam_id),
-                                getattr(d, "_busy_ms", None),
+                                getattr(d, "frame_cpu_ms", None),
                                 getattr(d, "source_width", 0) or getattr(d, "stream_width", 0),
                                 getattr(d, "source_height", 0) or getattr(d, "stream_height", 0),
-                                bool(getattr(d, "_cap_keyframes", False)))
+                                bool(getattr(d, "_cap_keyframes", False)),
+                                0.0 if cam_id in view_only else baseline)
                      for cam_id, d in list(self._decoders.items())],
-                    ceiling_fps=self.publish_fps, cpu_only=cpu_only, budget_ms=budget_ms)
+                    ceiling_fps=self.publish_fps, budget_ms=budget_ms)
+                rates = allocation.rates
+                self.wall_budget_status = allocation.summary()
             except Exception:  # noqa: BLE001 - the wall must keep publishing
                 log.debug("wall budget allocation failed; keeping last rates", exc_info=True)
                 rates = {}
@@ -1884,6 +1889,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
             engine={"frames_processed": pipe.frames_processed,
                     "alerts_queued": pipe.alerts_queued,
                     "target_fps": target_fps, "cameras": len(pipe._decoders),
+                    "wall_budget": getattr(pipe, "wall_budget_status", None),
                     "context_suppressions": sum(
                         state.context_suppression_count for state in states.values()
                     )},
