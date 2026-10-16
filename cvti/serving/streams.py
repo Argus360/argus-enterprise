@@ -162,7 +162,8 @@ class StreamDecoder:
                  keyframes_only_min_width: int = 0,
                  keyframe_policy: str = "auto",
                  keyframe_cost_share: float = 0.25,
-                 cost_window_s: float = 2.0) -> None:
+                 cost_window_s: float = 2.0,
+                 playout_idle_period: float = 2.0) -> None:
         self.camera_id = camera_id
         self.source = source
         # What decoding this stream costs THIS machine, in CPU time on the
@@ -199,6 +200,18 @@ class StreamDecoder:
         self._window_wall_s = 0.0
         self._window_frames = 0
         self._window_started_at = 0.0
+        # The playout buffer holds resized, JPEG-encoded frames for the MJPEG
+        # wall. It was fed on every kept frame whether or not anyone was
+        # watching, so a camera whose tile is closed or on WebRTC still paid
+        # a resize and a JPEG encode per frame (Tolu's audit, 15 Oct 2026).
+        # With no MJPEG viewer (display_fps == 0, set by the wall from the
+        # publisher's viewer count) the decoder now encodes one keep-alive
+        # frame every playout_idle_period seconds, so a tile that opens has a
+        # fresh picture at once, and skips the rest. Detection and evidence
+        # never used this buffer; they read the raw frame.
+        self.playout_idle_period = float(playout_idle_period)
+        self.playout_skipped = 0
+        self._last_idle_push = 0.0
         # Keyframe-only decode (capture.FFmpegKeyframeCapture) for a live
         # stream at least this wide; 0 = never. The first open is a normal
         # one, which tells us the width; a stream that qualifies is reopened
@@ -378,6 +391,7 @@ class StreamDecoder:
             "frame_cpu_ms": (round(self.frame_cpu_ms, 1)
                              if getattr(self, "frame_cpu_ms", None) is not None else None),
             "wall_fps": round(float(getattr(self, "display_fps", 0.0) or 0.0), 1),
+            "playout_skipped": getattr(self, "playout_skipped", 0),
             "source_width": getattr(self, "source_width", 0),      # tests build decoders raw
             "source_height": getattr(self, "source_height", 0),
             "source_fps": round(self._fps, 1),
@@ -726,7 +740,13 @@ class StreamDecoder:
                 # burst is exactly how the source-side lag grew before. The
                 # deque's depth cap bounds how far behind the wall can fall.
                 fullness = len(self.playout) / max(1, self.playout._frames.maxlen)
-                if self._governor.admit(fullness, time.perf_counter()):
+                watched = self.display_fps > 0
+                if not watched and (time.perf_counter() - self._last_idle_push
+                                    < self.playout_idle_period):
+                    self.playout_skipped += 1    # nobody watching: no encode
+                elif self._governor.admit(fullness, time.perf_counter()):
+                    if not watched:
+                        self._last_idle_push = time.perf_counter()
                     if self.playout.push(image):
                         self.stale_dropped += 1
                 else:
