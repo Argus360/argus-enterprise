@@ -4,6 +4,37 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.10 — 16 Oct 2026
+
+The decode and wall changes from Tolu's engineering audit of v1.10.9,
+reviewed by him. The repository now lives at Argus360/argus-enterprise.
+
+**Keyframe-only decode is decided by what decoding actually costs.** The
+engine measures the processor time each camera's decoding takes, per
+source frame and as a share of one core over a few seconds, and switches a
+large camera to keyframe-only decode when that share is high. Our own
+sampling rate cannot change the verdict, a computer whose graphics card
+decodes the video keeps full decoding, and cameras sending MJPEG, where
+every frame is already a keyframe, are never switched. `keyframe_decode`
+in the site file now has three meanings: unset decides per camera, true
+forces, false disables.
+
+**The rate each camera really delivers is shown**, and a camera that
+decodes keyframes only and delivers fewer than one frame every two seconds
+is named in health, with the fix: a detection substream, or a shorter
+keyframe interval on the camera.
+
+**The camera wall shares a decode budget properly.** Detection's own
+decoding is reserved first; what is left is shared among the tiles someone
+is watching, by each camera's measured cost; a tile is never asked for
+more than the wall rate; and when the budget cannot fit, health says so
+and names the levers instead of pretending.
+
+**The wall's JPEG frames are encoded only while someone is watching.** A
+camera whose tile is closed, or playing over WebRTC, no longer pays a
+resize and an encode per decoded frame; one keep-alive frame every two
+seconds keeps an opening tile instant.
+
 ## v1.10.9 — 14 Oct 2026
 
 **A computer with a graphics card is treated as one.** The installed app
