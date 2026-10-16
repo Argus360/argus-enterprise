@@ -471,7 +471,8 @@ class MultiStreamPipeline:
                  keyframe_min_width: int = 2000,
                  detector_threads: int | None = None,
                  keyframe_cost_share: float = 0.25,
-                 wall_decode_budget_ms: float | None = None) -> None:
+                 wall_decode_budget_ms: float | None = None,
+                 keyframe_min_fps: float = 0.5) -> None:
         # CPU share of one core, measured over fixed windows, above which an
         # eligible stream switches to keyframe-only decode under the "auto"
         # policy (see StreamDecoder).
@@ -479,6 +480,7 @@ class MultiStreamPipeline:
         # Decode milliseconds per second the wall may spend, shared by watched
         # cameras after the detection baseline (cvti.serving.wall_budget).
         self.wall_decode_budget_ms = wall_decode_budget_ms
+        self.keyframe_min_fps = float(keyframe_min_fps)
         # Threads for the CPU detector session (cvti.detector.accel). None =
         # detector_threads_for(): one core kept free on a CPU-only box.
         self.detector_threads = detector_threads
@@ -640,7 +642,8 @@ class MultiStreamPipeline:
                 probe_source=self.fallback_sources.get(cam_id, src),
                 keyframes_only_min_width=(self.keyframe_min_width if policy != "off" else 0),
                 keyframe_policy=policy,
-                keyframe_cost_share=self.keyframe_cost_share).start()
+                keyframe_cost_share=self.keyframe_cost_share,
+                keyframe_min_fps=self.keyframe_min_fps).start()
         if self.smooth_publish:
             import threading as _th
             self._smooth_thread = _th.Thread(target=self._smooth_publish_loop,
@@ -1573,6 +1576,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                                 if isinstance(site.get("keyframe_decode"), bool) else None),
                                keyframe_min_width=int(site.get("keyframe_min_width", 2000) or 2000),
                                keyframe_cost_share=float(site.get("keyframe_cost_share", 0.25) or 0.25),
+                               keyframe_min_fps=float(site.get("keyframe_min_fps", 0.5) or 0.5),
                                detector_threads=(int(site["detector_threads"])
                                                  if isinstance(site.get("detector_threads"), int)
                                                  and not isinstance(site.get("detector_threads"), bool)
