@@ -42,8 +42,8 @@ class _Cap:
 
     def _work(self):
         if self.burn_ms:
-            t = time.thread_time()
-            while (time.thread_time() - t) * 1000.0 < self.burn_ms:
+            t = time.perf_counter()          # wall-clock spin: CPU on every platform
+            while (time.perf_counter() - t) * 1000.0 < self.burn_ms:
                 pass
 
     def read(self):
