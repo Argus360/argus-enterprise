@@ -466,7 +466,12 @@ class MultiStreamPipeline:
                  camera_dewarp: dict | None = None,
                  keyframe_decode: bool | None = None,
                  keyframe_min_width: int = 2000,
-                 detector_threads: int | None = None) -> None:
+                 detector_threads: int | None = None,
+                 keyframe_cost_share: float = 0.25) -> None:
+        # CPU share of one core, measured over fixed windows, above which an
+        # eligible stream switches to keyframe-only decode under the "auto"
+        # policy (see StreamDecoder).
+        self.keyframe_cost_share = float(keyframe_cost_share)
         # Threads for the CPU detector session (cvti.detector.accel). None =
         # detector_threads_for(): one core kept free on a CPU-only box.
         self.detector_threads = detector_threads
@@ -597,12 +602,22 @@ class MultiStreamPipeline:
         # now viewer-aware: the smooth loop raises display_fps on exactly the
         # cameras with an open /stream connection and drops it when the last
         # viewer leaves. Smoother where eyes are, ~3x cheaper where none are.
-        keyframes = (self.keyframe_decode if self.keyframe_decode is not None
-                     else compute_device(self.device) == "cpu")
-        if keyframes:
-            log.info("[serving] CPU-only box: live streams %d px wide or more decode keyframes "
-                     "only (keyframe_decode / keyframe_min_width in the site file override)",
-                     self.keyframe_min_width)
+        # Keyframe-only decode is decided per camera by MEASURED decode cost
+        # (streams.StreamDecoder.decode_cpu_ms), not by whether detection has
+        # a GPU: a GPU box can still decode on the CPU, and a hardware decoder
+        # makes a wide stream cheap (Tolu's audit, 15 Oct 2026). The site can
+        # still force it off or on.
+        # Three settings (Tolu's review): unset = measure and decide per
+        # camera; true = force every eligible wide stream to keyframes; false
+        # = never. Measured cost is a CPU share over fixed windows, so our own
+        # sampling rate cannot change the verdict.
+        policy = ("auto" if self.keyframe_decode is None
+                  else "force" if self.keyframe_decode else "off")
+        if policy != "off":
+            log.info("[serving] keyframe-only decode policy=%s for live streams %d px wide or "
+                     "more (auto switches when decoding measures %.0f%% of a core or more; "
+                     "keyframe_decode / keyframe_min_width / keyframe_cost_share in the site file)",
+                     policy, self.keyframe_min_width, self.keyframe_cost_share * 100)
         for cam_id, src in self.sources.items():
             vo = cam_id in self.view_only
             # A view-only camera decodes just enough to keep its link state
@@ -616,7 +631,9 @@ class MultiStreamPipeline:
                 dewarp=self.camera_dewarp.get(cam_id),
                 idle_when_unwatched=vo,
                 probe_source=self.fallback_sources.get(cam_id, src),
-                keyframes_only_min_width=(self.keyframe_min_width if keyframes else 0)).start()
+                keyframes_only_min_width=(self.keyframe_min_width if policy != "off" else 0),
+                keyframe_policy=policy,
+                keyframe_cost_share=self.keyframe_cost_share).start()
         if self.smooth_publish:
             import threading as _th
             self._smooth_thread = _th.Thread(target=self._smooth_publish_loop,
@@ -1524,6 +1541,7 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                keyframe_decode=(bool(site["keyframe_decode"])
                                                 if isinstance(site.get("keyframe_decode"), bool) else None),
                                keyframe_min_width=int(site.get("keyframe_min_width", 2000) or 2000),
+                               keyframe_cost_share=float(site.get("keyframe_cost_share", 0.25) or 0.25),
                                detector_threads=(int(site["detector_threads"])
                                                  if isinstance(site.get("detector_threads"), int)
                                                  and not isinstance(site.get("detector_threads"), bool)
