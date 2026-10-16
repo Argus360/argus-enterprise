@@ -84,8 +84,12 @@ class _Cap:
         if self.wait_ms:
             time.sleep(self.wait_ms / 1000.0)
         if self.burn_ms:
-            t = time.thread_time()
-            while (time.thread_time() - t) * 1000.0 < self.burn_ms:
+            # Spin on the wall clock: a busy loop is CPU time on every
+            # platform. Polling time.thread_time() here instead made a 1 ms
+            # burn last 15 ms on Windows, whose thread clock ticks that
+            # coarsely, and a cheap camera looked expensive in CI.
+            t = time.perf_counter()
+            while (time.perf_counter() - t) * 1000.0 < self.burn_ms:
                 pass
 
     def grab(self):
