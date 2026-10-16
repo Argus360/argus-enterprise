@@ -222,7 +222,9 @@ class StreamDecoder:
         # substream, or a shorter I-frame interval on the camera).
         self.codec = ""
         self.keyframe_min_fps = float(keyframe_min_fps)
-        self.achieved_fps: float | None = None     # EWMA of delivered frames/s
+        self.achieved_fps: float | None = None     # delivered frames/s, counted
+        self._rate_window_start = 0.0              # first frame of the open window
+        self._rate_window_frames = 0               # frames since then
         self._sparse_warned = False
         # Keyframe-only decode (capture.FFmpegKeyframeCapture) for a live
         # stream at least this wide; 0 = never. The first open is a normal
@@ -338,6 +340,7 @@ class StreamDecoder:
     # ("this machine sustains ~2.7fps of 1920x1080@25 — use the camera's
     # substream") instead of just looking slow.
     ADAPT_FLOOR_FPS = 1.0
+    RATE_WINDOW_S = 2.0        # achieved_fps: frames counted over at least this long
     ADAPT_TOLERANCE = 1.15   # 15% over pace is jitter; beyond it is deficit
 
     @property
@@ -609,6 +612,8 @@ class StreamDecoder:
         self._cap = cap
         self.codec = self._codec_of(cap) or self.codec
         self.achieved_fps = None               # a new capture: measure its rate afresh
+        self._rate_window_start = 0.0
+        self._rate_window_frames = 0
         self._sparse_warned = False
         if want and not self._cap_keyframes:
             # No ffmpeg or it refused: do not ask again for this stream.
@@ -751,14 +756,26 @@ class StreamDecoder:
                 self.ended = True          # webcam exhausted / looping disabled
                 break
             attempt = 0                    # a healthy read resets the backoff
-            previous_frame_at = self.last_frame_at
             self.last_frame_at = time.time()
-            if previous_frame_at:
-                gap = self.last_frame_at - previous_frame_at
-                if 0.0 < gap < 60.0:
-                    rate = 1.0 / gap
+            # The delivered rate is frames counted over a window, never an
+            # average of instantaneous 1/gap: a recorder that releases a
+            # burst of buffered frames after a stall has millisecond gaps
+            # inside the burst, and averaging their reciprocals reported
+            # hundreds of frames a second for a 640x480 camera (CHI, 16 Oct
+            # 2026). A window closes on the first frame at least
+            # RATE_WINDOW_S after it opened, so a keyframe-only camera at
+            # one frame every 12 s still measures as 0.08/s, not as 0.
+            if not self._rate_window_start:
+                self._rate_window_start = self.last_frame_at
+            else:
+                self._rate_window_frames += 1
+                elapsed = self.last_frame_at - self._rate_window_start
+                if elapsed >= self.RATE_WINDOW_S:
+                    rate = self._rate_window_frames / elapsed
                     self.achieved_fps = (rate if self.achieved_fps is None
-                                         else 0.2 * rate + 0.8 * self.achieved_fps)
+                                         else 0.5 * rate + 0.5 * self.achieved_fps)
+                    self._rate_window_start = self.last_frame_at
+                    self._rate_window_frames = 0
                     if (self._cap_keyframes and not self._sparse_warned
                             and self.achieved_fps < self.keyframe_min_fps):
                         self._sparse_warned = True

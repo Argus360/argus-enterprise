@@ -106,12 +106,54 @@ class CodecAwareTests(unittest.TestCase):
         self.assertEqual(st.StreamDecoder._codec_of(N()), "")
 
 
+def _deliver(d, at: float) -> None:
+    """Replay one frame arrival's rate bookkeeping at wall time `at`,
+    exactly as the decoder loop does, without running the loop."""
+    d.last_frame_at = at
+    if not d._rate_window_start:
+        d._rate_window_start = at
+        return
+    d._rate_window_frames += 1
+    elapsed = at - d._rate_window_start
+    if elapsed >= d.RATE_WINDOW_S:
+        rate = d._rate_window_frames / elapsed
+        d.achieved_fps = rate if d.achieved_fps is None else 0.5 * rate + 0.5 * d.achieved_fps
+        d._rate_window_start = at
+        d._rate_window_frames = 0
+
+
 class AchievedRateTests(unittest.TestCase):
     def test_the_delivered_rate_is_measured_and_reported(self):
-        d, _ = _run("MJPG", burn_ms=0.0, every_ms=100.0, seconds=1.5)
+        from cvti.serving import streams as st
+        with mock.patch.object(st.StreamDecoder, "RATE_WINDOW_S", 0.5):
+            d, _ = _run("MJPG", burn_ms=0.0, every_ms=50.0, seconds=1.5)
         self.assertIsNotNone(d.achieved_fps)
-        self.assertAlmostEqual(d.achieved_fps, 10.0, delta=3.0)
+        self.assertAlmostEqual(d.achieved_fps, 20.0, delta=5.0)
         self.assertEqual(d.ingest_status()["achieved_fps"], round(d.achieved_fps, 2))
+
+    def test_a_burst_after_a_stall_is_not_hundreds_of_frames_a_second(self):
+        # CHI, 16 Oct 2026: 640x480 recorder cameras reported achieved_fps=327
+        # because the rate averaged 1/gap and a post-stall burst has
+        # millisecond gaps. Ten frames in 10 ms then a 2 s pause is 5/s.
+        from cvti.serving import streams as st
+        d = st.StreamDecoder("cam", "rtsp://x/y")
+        t = 1000.0
+        _deliver(d, t)
+        for i in range(1, 11):
+            _deliver(d, t + i * 0.001)
+        _deliver(d, t + 2.0)
+        self.assertIsNotNone(d.achieved_fps)
+        self.assertLess(d.achieved_fps, 6.0)
+        self.assertGreater(d.achieved_fps, 4.0)
+
+    def test_one_keyframe_every_twelve_seconds_measures_as_sparse_not_zero(self):
+        from cvti.serving import streams as st
+        d = st.StreamDecoder("cam", "rtsp://x/y")
+        t = 1000.0
+        _deliver(d, t)
+        self.assertIsNone(d.achieved_fps)       # one frame says nothing yet
+        _deliver(d, t + 12.5)
+        self.assertAlmostEqual(d.achieved_fps, 0.08, delta=0.01)
 
     def test_sparse_keyframes_are_warned_about_once(self):
         from cvti.serving import streams as st
