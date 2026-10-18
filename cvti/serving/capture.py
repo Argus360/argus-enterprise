@@ -156,22 +156,46 @@ class FFmpegKeyframeCapture:
         self.codec = ""
         self._frame_bytes = 0
         self._proc = None
+        self._sock = None
+        self._buf = None
         self._stderr_tail: list = []
         self._size_ready = threading.Event()
+        # Raw frames travel over a loopback TCP socket, not ffmpeg's stdout.
+        # A 2592x1520 BGR frame is 12 MB; through an anonymous pipe on
+        # Windows that arrives in kilobyte-sized reads, thousands of system
+        # calls and context switches per frame, and on CHI's 5-vCPU server
+        # one keyframe cost about a second of CPU to receive (18 Oct 2026,
+        # frame_cpu_ms 800 to 1400 while the decode itself is 10 to 30 ms).
+        # A socket with a large receive buffer takes the same frame in a
+        # handful of recv_into calls straight into a reusable buffer.
+        import socket
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(open_timeout_s)
+        except OSError as exc:
+            log.warning("[keyframes] could not open a loopback socket: %s", exc)
+            listener.close()
+            return
+        port = listener.getsockname()[1]
         cmd = [binary, "-hide_banner", "-nostdin", "-loglevel", "info"]
         if self.source.lower().startswith("rtsp"):
             cmd += ["-rtsp_transport", "tcp", "-timeout", str(int(io_timeout_s * 1_000_000))]
         cmd += ["-skip_frame", "nokey", "-i", self.source, "-an", "-sn",
-                "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+                "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                f"tcp://127.0.0.1:{port}"]
         flags = {}
         if sys.platform == "win32":
             flags["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                           stderr=subprocess.PIPE, bufsize=0, **flags)
         except OSError as exc:
             log.warning("[keyframes] could not start ffmpeg: %s", exc)
+            listener.close()
             return
+        self._listener = listener
         pattern = re.compile(r"Video: (\w+).*?,\s*(\d{2,5})x(\d{2,5})")
 
         def pump() -> None:
@@ -198,36 +222,57 @@ class FFmpegKeyframeCapture:
             log.warning("[keyframes] %s: no video stream within %.0fs (%s)",
                         _redact(self.source), open_timeout_s, " | ".join(self._stderr_tail[-2:]))
             self.release()
+            return
+        # ffmpeg connects once it has opened the input; accept that one client.
+        try:
+            conn, _peer = listener.accept()
+        except (OSError, socket.timeout) as exc:
+            log.warning("[keyframes] %s: ffmpeg did not connect within %.0fs (%s)",
+                        _redact(self.source), open_timeout_s, exc)
+            self.release()
+            return
+        finally:
+            listener.close()
+            self._listener = None
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+        except OSError:
+            log.debug("[keyframes] SO_RCVBUF not honoured", exc_info=True)
+        conn.settimeout(max(io_timeout_s, 60.0))   # a GOP can be 12 s on CHI's cameras
+        self._sock = conn
+        self._buf = bytearray(self._frame_bytes)
 
     def isOpened(self) -> bool:  # noqa: N802 - cv2 API
-        return self._proc is not None and self._frame_bytes > 0 and self._proc.poll() is None
+        return (self._proc is not None and self._sock is not None and self._frame_bytes > 0
+                and self._proc.poll() is None)
 
-    def _read_frame(self):
+    def _read_frame(self) -> bool:
+        """Fill the frame buffer from the socket. False at end of stream."""
         if not self.isOpened():
-            return None
-        buf = bytearray()
+            return False
+        sock, buf = self._sock, self._buf
+        view = memoryview(buf)
         want = self._frame_bytes
+        got = 0
         try:
-            while len(buf) < want:
-                chunk = self._proc.stdout.read(want - len(buf))
-                if not chunk:
-                    return None
-                buf += chunk
+            while got < want:
+                n = sock.recv_into(view[got:], want - got)
+                if n <= 0:
+                    return False
+                got += n
         except (OSError, ValueError):
-            return None
-        return bytes(buf)
+            return False
+        return True
 
     def grab(self) -> bool:
-        self._last = self._read_frame()
-        return self._last is not None
+        return self._read_frame()
 
     def read(self):
-        data = self._read_frame()
-        if data is None:
+        if not self._read_frame():
             return False, None
         import numpy as np
-        frame = np.frombuffer(data, dtype=np.uint8).reshape((self.height, self.width, 3))
-        return True, frame.copy()
+        frame = np.frombuffer(self._buf, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return True, frame.copy()           # the buffer is reused by the next read
 
     def get(self, prop: int) -> float:
         if prop == _PROP_FRAME_WIDTH:
@@ -244,6 +289,19 @@ class FFmpegKeyframeCapture:
         self.release()
 
     def release(self) -> None:
+        sock, self._sock = self._sock, None
+        if sock is not None:
+            try:
+                sock.close()                # unblocks a recv_into in another thread
+            except OSError:
+                pass
+        listener = getattr(self, "_listener", None)
+        if listener is not None:
+            self._listener = None
+            try:
+                listener.close()
+            except OSError:
+                pass
         proc, self._proc = self._proc, None
         if proc is None:
             return
@@ -257,6 +315,8 @@ class FFmpegKeyframeCapture:
         except OSError:
             log.debug("[keyframes] terminate failed", exc_info=True)
         for pipe in (proc.stdout, proc.stderr):
+            if pipe is None:
+                continue
             try:
                 pipe.close()
             except OSError:
