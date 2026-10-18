@@ -4,6 +4,23 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.12 — 18 Oct 2026
+
+One fix, measured before it was built.
+
+**The keyframe reader receives frames over a local socket, not a pipe.**
+On Windows an anonymous pipe hands a 12 MB raw frame over in
+kilobyte-sized reads, thousands of system calls per frame. Measured on a
+Windows machine: 680 ms of CPU per 2592x1520 frame through the pipe, 13 ms
+over a loopback socket. On CHI's five-core server that was about one CPU
+second per keyframe on each of seven HEVC cameras, most of the engine's
+CPU, and the reason keyframes queued up and those streams dropped every
+few minutes. ffmpeg now writes to a loopback TCP port the engine listens
+on, and frames arrive in a few large reads into one reused buffer.
+Expected at CHI: the engine's CPU roughly halved, the big cameras feeding
+detection at their real keyframe rate, and the reconnect storm over.
+v1.10.11's stride change stays; it was not the cause.
+
 ## v1.10.11 — 18 Oct 2026
 
 One fix, found from CHI's own health file through the new control plane.
