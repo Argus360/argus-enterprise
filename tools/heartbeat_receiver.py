@@ -46,7 +46,19 @@ CREATE TABLE IF NOT EXISTS heartbeats (
     payload TEXT
 );
 CREATE INDEX IF NOT EXISTS hb_site_time ON heartbeats (site_id, received_at DESC);
+CREATE TABLE IF NOT EXISTS diagnostics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id TEXT NOT NULL,
+    received_at REAL NOT NULL,
+    filename TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL
+);
 """
+# A diagnostics upload is a zip the site operator chose to send (logs, health,
+# redacted site file - see tools/send_diagnostics.ps1). Never pushed by the
+# engine on its own; capped so a bad client cannot fill the disk.
+DIAG_MAX_BYTES = 30 * 1024 * 1024
+DIAG_LIST_LIMIT = 50
 
 
 class Store:
@@ -67,6 +79,21 @@ class Store:
 
     def close(self) -> None:
         self._db.close()
+
+    def record_diagnostic(self, site_id: str, filename: str, size: int,
+                          now: float | None = None) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO diagnostics (site_id, received_at, filename, size_bytes) "
+                "VALUES (?, ?, ?, ?)", (site_id, now or time.time(), filename, int(size)))
+            self._db.commit()
+
+    def diagnostics(self, limit: int = DIAG_LIST_LIMIT) -> list:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT site_id, received_at, filename, size_bytes FROM diagnostics "
+                "ORDER BY received_at DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
 
     def latest(self) -> dict:
         """site_id -> its most recent heartbeat row (parsed)."""
@@ -146,7 +173,28 @@ def telegram_notifier(token: str, chat_id: str):
     return send
 
 
-def render_dashboard(views: list, now: float | None = None) -> str:
+def render_diagnostics(items: list, token: str = "", now: float | None = None) -> str:
+    """The uploads table under the sites table: newest first, one link each."""
+    if not items:
+        return "<p class='mut'>No diagnostics uploaded yet.</p>"
+    now = now or time.time()
+    q = f"?token={urllib.parse.quote(token)}" if token else ""
+    rows = []
+    for it in items:
+        age_s = now - float(it["received_at"])
+        when = time.strftime("%d %b %H:%M", time.localtime(float(it["received_at"])))
+        href = (f"/diagnostics/{urllib.parse.quote(it['site_id'])}/"
+                f"{urllib.parse.quote(it['filename'])}{q}")
+        rows.append(f"<tr><td><b>{html.escape(it['site_id'])}</b></td>"
+                    f"<td>{html.escape(when)} ({age_s / 3600:.1f}h ago)</td>"
+                    f"<td>{int(it['size_bytes']) // 1024} KB</td>"
+                    f"<td><a href='{href}'>{html.escape(it['filename'])}</a></td></tr>")
+    return ("<h2>Diagnostics uploads</h2><table><tr><th>Site</th><th>Received</th>"
+            "<th>Size</th><th>File</th></tr>" + "".join(rows) + "</table>")
+
+
+def render_dashboard(views: list, now: float | None = None, diagnostics: list | None = None,
+                     token: str = "") -> str:
     """One HTML page, no assets, refreshes itself. Worst sites first."""
     order = {"missed": 0, "critical": 1, "degraded": 2, "never-reported": 3,
              "unknown": 4, "ok": 5}
@@ -182,7 +230,7 @@ def render_dashboard(views: list, now: float | None = None) -> str:
 <title>Argus sites</title>
 <style>
  body{{background:#0a1326;color:#edf1f8;font:14px system-ui;margin:0;padding:28px}}
- h1{{font-size:16px;margin:0 0 4px}} .mut{{color:#8d94a6;font-size:12px}}
+ h1{{font-size:16px;margin:0 0 4px}} h2{{font-size:13px;margin:28px 0 0;color:#8d94a6}} a{{color:#7dd3fc}} .mut{{color:#8d94a6;font-size:12px}}
  table{{border-collapse:collapse;margin-top:18px;width:100%;max-width:980px}}
  td,th{{text-align:left;padding:9px 14px;border-bottom:1px solid #1f2c48;font-size:13px}}
  th{{color:#5f6b84;font-size:10px;text-transform:uppercase;letter-spacing:.08em}}
@@ -190,15 +238,17 @@ def render_dashboard(views: list, now: float | None = None) -> str:
 <h1>Argus — deployed sites</h1>
 <div class="mut">Health signals only; no footage leaves any site. Refreshes every 30s.</div>
 <table><tr><th>Site</th><th>State</th><th>Last heartbeat</th><th>Cameras live</th><th>Why</th></tr>
-{body}</table>"""
+{body}</table>
+{render_diagnostics(diagnostics or [], token, now) if diagnostics is not None else ""}"""
 
 
 class Receiver:
     def __init__(self, *, keys: dict, db_path: str | Path = "heartbeats.db",
                  alerter: Alerter | None = None, interval: float = DEFAULT_INTERVAL_S,
-                 dashboard_token: str = "") -> None:
+                 dashboard_token: str = "", diag_dir: str | Path | None = None) -> None:
         self.keys = keys
         self.store = Store(db_path)
+        self.diag_dir = Path(diag_dir) if diag_dir else None
         self.alerter = alerter or Alerter()
         self.interval = interval
         self.dashboard_token = dashboard_token
@@ -221,6 +271,40 @@ class Receiver:
             return 401, "unknown site or wrong key"
         self.store.record(site_id, payload)
         return 200, "ok"
+
+    def handle_diagnostic(self, site_key: str, site_id: str, name: str, body: bytes) -> tuple:
+        """Store one uploaded zip for a known site. Same key as the heartbeat."""
+        import hmac
+        import re
+        if self.diag_dir is None:
+            return 404, "diagnostics inbox not enabled"
+        expected = self.keys.get(site_id or "")
+        if not expected or not hmac.compare_digest(site_key, expected):
+            return 401, "unknown site or wrong key"
+        if not body or len(body) > DIAG_MAX_BYTES:
+            return 413, f"empty or over {DIAG_MAX_BYTES // (1024 * 1024)} MB"
+        if body[:2] != b"PK":
+            return 415, "not a zip"
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "diagnostics.zip")[:120]
+        if not safe.lower().endswith(".zip"):
+            safe += ".zip"
+        filename = time.strftime("%Y%m%d-%H%M%S") + "-" + safe
+        folder = self.diag_dir / re.sub(r"[^A-Za-z0-9._-]", "_", site_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / filename).write_bytes(body)
+        self.store.record_diagnostic(site_id, filename, len(body))
+        return 200, f"stored {filename} ({len(body) // 1024} KB)"
+
+    def diagnostic_path(self, site_id: str, filename: str) -> Path | None:
+        """Resolve a download, refusing anything that is not a plain file name."""
+        if self.diag_dir is None or "/" in site_id or "/" in filename or ".." in filename:
+            return None
+        path = (self.diag_dir / site_id / filename).resolve()
+        try:
+            path.relative_to(self.diag_dir.resolve())
+        except ValueError:
+            return None
+        return path if path.is_file() else None
 
     def views(self, now: float | None = None) -> list:
         latest = self.store.latest()
@@ -248,7 +332,22 @@ class Receiver:
                 self.wfile.write(data)
 
             def do_POST(self):
-                if self.path.rstrip("/") != "/heartbeat":
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path.rstrip("/") == "/diagnostics":
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length > DIAG_MAX_BYTES:
+                        self._send(413, "too large")
+                        return
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    code, msg = recv.handle_diagnostic(
+                        self.headers.get("X-Argus-Site-Key", ""),
+                        (qs.get("site_id") or [""])[0], (qs.get("name") or [""])[0],
+                        self.rfile.read(length))
+                    print(f"[receiver] diagnostics from {self.client_address[0]}: {code} {msg}",
+                          flush=True)
+                    self._send(code, msg)
+                    return
+                if parsed.path.rstrip("/") != "/heartbeat":
                     self._send(404, "not found")
                     return
                 length = int(self.headers.get("Content-Length") or 0)
@@ -267,7 +366,23 @@ class Receiver:
                         self._send(401, "dashboard token required (?token=...)")
                         return
                 if parsed.path in ("/", "/index.html"):
-                    self._send(200, render_dashboard(recv.views()), "text/html")
+                    diags = recv.store.diagnostics() if recv.diag_dir is not None else None
+                    self._send(200, render_dashboard(recv.views(), diagnostics=diags,
+                                                     token=recv.dashboard_token), "text/html")
+                elif parsed.path.startswith("/diagnostics/"):
+                    parts = parsed.path.split("/", 3)
+                    path = recv.diagnostic_path(urllib.parse.unquote(parts[2]),
+                                                urllib.parse.unquote(parts[3])) if len(parts) == 4 else None
+                    if path is None:
+                        self._send(404, "not found")
+                    else:
+                        data = path.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/zip")
+                        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
                 elif parsed.path == "/sites.json":
                     self._send(200, json.dumps(recv.views(), default=str),
                                "application/json")
@@ -301,6 +416,8 @@ def main() -> int:
                    help="<bot_token>:<chat_id> for transition alerts")
     p.add_argument("--dashboard-token", default="",
                    help="require ?token=... on the dashboard")
+    p.add_argument("--diag-dir", default="",
+                   help="enable the diagnostics inbox: zips POSTed to /diagnostics land here")
     args = p.parse_args()
 
     keys = json.loads(Path(args.keys).read_text())
@@ -309,7 +426,8 @@ def main() -> int:
         token, _, chat = args.telegram.rpartition(":")
         notify = telegram_notifier(token, chat)
     receiver = Receiver(keys=keys, db_path=args.db, interval=args.interval,
-                        alerter=Alerter(notify), dashboard_token=args.dashboard_token)
+                        alerter=Alerter(notify), dashboard_token=args.dashboard_token,
+                        diag_dir=args.diag_dir or None)
     receiver.serve(args.host, args.port)
     return 0
 
