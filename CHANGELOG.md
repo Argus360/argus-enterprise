@@ -4,6 +4,21 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.11 — 18 Oct 2026
+
+One fix, found from CHI's own health file through the new control plane.
+
+**Keyframe-only cameras no longer burn a second of CPU per frame.** The
+decoder's frame-skipping stride, meant for a normal 25 fps capture, was also
+applied to the keyframe reader, where every skipped frame is a whole
+keyframe read and thrown away: 30 to 100 reads per frame kept, about a
+second of CPU each, one frame delivered every 3 to 12 seconds, and a
+backed-up pipe that dropped the stream every few minutes. In keyframe mode
+the decoder now reads every keyframe as it arrives, with no stride, no
+adaptive slowdown and no pacing sleep. On CHI's five-core server this is
+expected to free about 2.5 cores and to feed the seven HEVC cameras to
+detection at their real keyframe rate.
+
 ## v1.10.10 — 16 Oct 2026
 
 The decode and wall changes from Tolu's engineering audit of v1.10.9,
