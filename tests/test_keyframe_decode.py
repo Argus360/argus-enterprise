@@ -94,11 +94,74 @@ class _Cap:
 
     def grab(self):
         self._work()                   # OpenCV decodes a skipped frame too
+        self.grabs = getattr(self, "grabs", 0) + 1
         return True
 
     def read(self):
         self._work()
+        self.reads = getattr(self, "reads", 0) + 1
         return True, np.zeros((8, self.width, 3), np.uint8)
+
+
+class KeyframeCaptureIsNeverStrideSkippedTests(unittest.TestCase):
+    """CHI, 18 Oct 2026: with the big cameras on keyframe-only decode the
+    engine still held 70% of a 5-core box while the model used 15%. The
+    health file explained it: frame_cpu_ms 870 to 1550 per kept frame against
+    decode_cpu_ms 13 to 29 per source frame, i.e. 30 to 100 grab() calls per
+    read. On the keyframe reader every grab() reads a whole keyframe and
+    discards it. A keyframe capture is already the sample: no stride, no
+    adaptive cap from its waits."""
+
+    def test_every_keyframe_is_read_and_none_are_grabbed_away(self):
+        from cvti.serving import streams as st
+        caps = []
+
+        def fake_open(source, keyframes_only=False, **_kw):
+            cap = _Cap(2592, keyframes_only=keyframes_only, burn_ms=0.0, wait_ms=5.0)
+            caps.append(cap)
+            return cap
+
+        # target 1 fps against a 30 fps source: a full-decode capture is
+        # stride-skipped 29 grabs per read. The first open is always a full
+        # decode (it learns the width); with the policy forced, the stream is
+        # reopened on the keyframe reader right after.
+        d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=1.0,
+                             keyframes_only_min_width=2000, keyframe_policy="force")
+        with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
+            d.start()
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not any(c.keyframes_only for c in caps):
+                time.sleep(0.05)
+            time.sleep(0.4)
+            d.stop()
+        key = [c for c in caps if c.keyframes_only]
+        self.assertTrue(key, "the stream was reopened on the keyframe reader")
+        cap = key[0]
+        self.assertGreaterEqual(getattr(cap, "reads", 0), 5, "keyframes are read as they arrive")
+        self.assertEqual(getattr(cap, "grabs", 0), 0, "no keyframe is grabbed and thrown away")
+        full = caps[0]
+        self.assertGreater(getattr(full, "grabs", 0), 0, "the full-decode open was stride-sampled")
+        # The camera's GOP wait is not our cost: the adaptive cap stays open.
+        self.assertGreaterEqual(d.sustainable_fps, 29.0)
+
+    def test_full_decode_capture_still_stride_skips(self):
+        from cvti.serving import streams as st
+        caps = []
+
+        def fake_open(source, keyframes_only=False, **_kw):
+            cap = _Cap(640, keyframes_only=False, burn_ms=0.0, wait_ms=1.0)
+            caps.append(cap)
+            return cap
+
+        d = st.StreamDecoder("cam", "rtsp://127.0.0.1:8554/cam", target_fps=10.0,
+                             keyframes_only_min_width=2000, keyframe_policy="off")
+        with mock.patch("cvti.serving.capture.open_capture", side_effect=fake_open):
+            d.start()
+            time.sleep(0.5)
+            d.stop()
+        cap = caps[0]
+        self.assertGreater(getattr(cap, "grabs", 0), getattr(cap, "reads", 0),
+                           "a full-decode capture is still sampled by stride")
 
 
 class DecoderPolicyTests(unittest.TestCase):
