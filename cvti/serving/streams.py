@@ -661,6 +661,22 @@ class StreamDecoder:
             if self.fell_back:
                 cap = self._maybe_return_to_relay(cap)
             stride, self._min_period = self._pacing()
+            if self._cap_keyframes:
+                # A keyframe-only capture already IS the sample: it hands over
+                # one frame per GOP and nothing in between. Stride-skipping
+                # here made every grab() read and throw away a whole keyframe
+                # (12 MB of raw pixels on a 2592x1520 camera), so a stride of
+                # 25 to 100 cost 1 to 1.5 s of CPU per frame kept and starved
+                # detection to one frame every 3 to 12 s (CHI, 18 Oct 2026:
+                # frame_cpu_ms 870 to 1550 while decode_cpu_ms was 13 to 29).
+                # No pacing sleep either: ffmpeg writes raw frames into a
+                # pipe, and sleeping between reads backs that pipe up until
+                # ffmpeg stalls on its RTSP input and the stream drops (the
+                # same cameras logged "stream dropped; reopening" every few
+                # minutes). Every keyframe is read the moment it arrives;
+                # the detector still samples at its own rate downstream.
+                stride = 1
+                self._min_period = 0.0
             if self.playout is not None:
                 # Playout pops at content rate; a boosted camera's content
                 # rate is the boosted one, or the wall stays at 4fps anyway.
@@ -697,8 +713,12 @@ class StreamDecoder:
                 self.frame_cpu_ms = (frame_cpu if self.frame_cpu_ms is None
                                      else 0.2 * frame_cpu + 0.8 * self.frame_cpu_ms)
                 # What one kept frame COSTS on this machine (grabs + decode,
-                # wall time) — feeds the adaptive ingest cap.
-                self._observe_ingest(time.perf_counter() - loop_start, stride)
+                # wall time) — feeds the adaptive ingest cap. Not in keyframe
+                # mode: there the wall time is the camera's GOP, not our work,
+                # and treating it as cost shrank the sustainable rate, grew
+                # the stride, and discarded even more keyframes.
+                if not self._cap_keyframes:
+                    self._observe_ingest(time.perf_counter() - loop_start, stride)
                 if not self.stream_width:
                     self.stream_height, self.stream_width = image.shape[:2]
             if not ok:
