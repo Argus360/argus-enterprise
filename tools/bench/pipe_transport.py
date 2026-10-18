@@ -51,6 +51,9 @@ def a_stop(p):
     p.wait()
 
 
+c_stop = a_stop
+
+
 def c_start():
     return subprocess.Popen([FF, "-hide_banner", "-loglevel", "error", *SRC, "-"],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1 << 22)
