@@ -1,6 +1,8 @@
 name: bench-pipe-transport
 on:
   workflow_dispatch:
+  push:
+    branches: [bench/pipe-transport]
 jobs:
   bench:
     strategy:
