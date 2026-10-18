@@ -1,0 +1,17 @@
+name: bench-pipe-transport
+on:
+  workflow_dispatch:
+jobs:
+  bench:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy imageio-ffmpeg
+      - run: python tools/bench/pipe_transport.py "$(python -c "import imageio_ffmpeg as f; print(f.get_ffmpeg_exe())")"
+        shell: bash
