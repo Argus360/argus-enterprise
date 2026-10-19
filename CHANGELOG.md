@@ -4,6 +4,23 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.10.13 — 19 Oct 2026
+
+Two fixes from CHI's own logs, both about alerts that could never arrive.
+
+**Groq verdicts are no longer cut off mid-JSON.** The Groq default model
+thinks before it answers, and the thinking counted against the 96-token
+verdict budget, so every verdict came back unterminated and was held for
+a human instead of confirmed. The daily self-test caught it two days in a
+row. Groq is now asked for the answer only, the verdict budget is 192
+tokens, and a thinking block that still arrives is skipped.
+
+**Person tracks survive 1 fps detection.** The movement tracker forgot a
+person not seen for one second, a default tuned for several frames a
+second. At the pilot's 1 fps every person was forgotten between samples,
+nobody ever became "moving", and the movement alerts could not fire. The
+expiry now follows the camera's measured detection interval.
+
 ## v1.10.12 — 18 Oct 2026
 
 One fix, measured before it was built.
