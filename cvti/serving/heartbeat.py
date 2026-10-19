@@ -59,9 +59,15 @@ def heartbeat_payload(health: dict, *, site_id: str, now: float | None = None) -
         "status": health.get("status"),
         "reasons": list(health.get("reasons") or [])[:10],
         "uptime_s": health.get("uptime_s"),
+        "version": health.get("version"),
         "cameras": [{"id": c.get("camera_id"), "state": c.get("state"),
                      "last_frame_age_s": c.get("last_frame_age_s"),
-                     "reconnects": c.get("reconnects")}
+                     "reconnects": c.get("reconnects"),
+                     # detection counts: frames looked at, frames with a person,
+                     # seconds since a person was last seen. Counts, no pixels.
+                     "frames_analysed": (c.get("detection") or {}).get("frames_analysed"),
+                     "frames_with_people": (c.get("detection") or {}).get("frames_with_people"),
+                     "people_last_seen_s": (c.get("detection") or {}).get("people_last_seen_s")}
                     for c in (health.get("cameras") or [])],
         "gate": {"provider": gate.get("provider"), "reachable": gate.get("reachable"),
                  "verified": gate.get("verified"), "unverified": gate.get("unverified"),

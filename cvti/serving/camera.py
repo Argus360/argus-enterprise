@@ -184,6 +184,11 @@ class PerCameraState:
     crowd_formation: bool = False     # tight group formation
     normal_movement: bool = False     # telemetry-only moving-person state
     multiple_people_moving: bool = False
+    # Detection counters for health / heartbeat (see detection_status()).
+    frames_analysed: int = 0
+    frames_with_people: int = 0
+    people_in_last_frame: int = 0
+    people_last_seen_at: float = 0.0
     object_watch: bool = False
     general_object_tracking: bool = False
     general_object_tracking_overlays: bool = False
@@ -856,6 +861,16 @@ class PerCameraState:
         # subject was, so evidence can point at who rather than at a whole frame.
         self._box_by_track = {tid: (int(x1), int(y1), int(x2), int(y2))
                               for (tid, x1, y1, x2, y2) in _person_boxes(tracked)}
+        # What the model actually saw, counted: "is detection working on this
+        # camera" has only ever been answerable by someone walking in front
+        # of it while someone else watched (CHI, 19 Oct 2026). These travel in
+        # health and in the heartbeat; counts only, never pixels.
+        self.frames_analysed += 1
+        people_now = len(self._box_by_track)
+        self.people_in_last_frame = people_now
+        if people_now:
+            self.frames_with_people += 1
+            self.people_last_seen_at = time.time()
 
         # Fall / panic-running / crowd-formation work off tracked PERSON boxes.
         if self.fall or self.running or self.crowd_formation:
@@ -1563,3 +1578,18 @@ def _apply_object_watch_settings(state: "PerCameraState", cam: dict) -> bool:
 
 def load_site_config(path: str | Path) -> dict:
     return json.loads(Path(path).read_text())
+
+
+def detection_status(state: Any, now: float | None = None) -> dict:
+    """Counts only: frames the model looked at, how many had a person, how
+    long ago one was last seen. None where the camera runs no detection."""
+    now = time.time() if now is None else now
+    analysed = int(getattr(state, "frames_analysed", 0) or 0)
+    with_people = int(getattr(state, "frames_with_people", 0) or 0)
+    last = float(getattr(state, "people_last_seen_at", 0.0) or 0.0)
+    return {
+        "frames_analysed": analysed,
+        "frames_with_people": with_people,
+        "people_in_last_frame": int(getattr(state, "people_in_last_frame", 0) or 0),
+        "people_last_seen_s": (round(max(0.0, now - last), 1) if last else None),
+    }

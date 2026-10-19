@@ -78,7 +78,7 @@ class WhitelistTest(unittest.TestCase):
         self.assertEqual(sorted(p), sorted([
             "schema", "site_id", "sent_at", "status", "reasons", "uptime_s",
             "cameras", "gate", "disk", "memory", "components", "engine",
-            "self_test"]))
+            "self_test", "version"]))
 
 
 class SenderTest(unittest.TestCase):
