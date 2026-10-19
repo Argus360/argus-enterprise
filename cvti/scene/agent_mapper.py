@@ -627,6 +627,13 @@ def call_openai_compatible(
     # seconds of gate latency. Ollama's /v1 endpoint maps this to num_predict.
     if max_tokens is not None:
         payload["max_tokens"] = int(max_tokens)
+    if "api.groq.com" in api_base_url:
+        # Groq's Qwen models think out loud before answering, and the
+        # thinking counts against max_tokens: with a 96-token verdict budget
+        # the JSON never arrived and the gate logged "Unterminated JSON"
+        # (CHI daily self-test, 18 and 19 Oct 2026). Ask for the answer only.
+        payload["reasoning_format"] = "hidden"
+        payload["reasoning_effort"] = "none"
     base = api_base_url.rstrip("/")
     headers = {
         "content-type": "application/json",

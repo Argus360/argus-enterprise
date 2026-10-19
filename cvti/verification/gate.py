@@ -500,7 +500,11 @@ class VerificationGate:
     # its verdict — that parse failure lands fail-visible as UNVERIFIED, never
     # as a dropped alert. The non-CoT prompt asks for the JSON object alone: 96.
     MAX_TOKENS_COT = 256
-    MAX_TOKENS_JSON = 96
+    # A verdict is a small JSON object with a one-sentence reason: 96 tokens
+    # was tight for it even with no reasoning, and a model that prefixes a
+    # few words of preamble ran out mid-object. 192 is still a bounded,
+    # one-second answer on a CPU box and leaves the reason room to finish.
+    MAX_TOKENS_JSON = 192
     # Transport budget for LOCAL verifies (audit 1 Sep, V2/V4b). One retry,
     # not three: by the second failure of a live verdict the scene is long
     # gone, and fail-visible UNVERIFIED in front of a human beats an 18-minute
@@ -1025,6 +1029,13 @@ def _call_openai_compatible(
 
 def _extract_json(text: str) -> dict:
     text = text.strip()
+    # A reasoning model that was not told to hide its thinking wraps it in
+    # <think> tags, braces and all, before the verdict. Skip that block; if
+    # the block never closes the answer was cut off and the usual
+    # "Unterminated JSON" below says so.
+    if "<think>" in text:
+        end = text.find("</think>")
+        text = text[end + len("</think>"):] if end >= 0 else text[text.rfind("<think>"):]
     start = text.find("{")
     if start < 0:
         raise RuntimeError("No JSON object in VLM response.")
