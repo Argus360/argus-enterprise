@@ -132,8 +132,10 @@ class GateCapTests(unittest.TestCase):
     def test_cot_verdicts_are_capped_at_256(self):
         self.assertEqual(self._gate_call_kwargs(cot=True)["max_tokens"], 256)
 
-    def test_json_only_verdicts_are_capped_at_96(self):
-        self.assertEqual(self._gate_call_kwargs(cot=False)["max_tokens"], 96)
+    def test_json_only_verdicts_are_capped_at_192(self):
+        # 96 cut real verdicts mid-object once a reason was included (CHI
+        # self-test, 18 Oct 2026); 192 is still a bounded one-second answer.
+        self.assertEqual(self._gate_call_kwargs(cot=False)["max_tokens"], 192)
 
     def test_scanner_caps_and_downscales_what_it_sends(self):
         from cvti.serving.custom_rules import CustomRuleScanner
