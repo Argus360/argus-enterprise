@@ -930,6 +930,16 @@ class PerCameraState:
         self._zones_by_track = zones_by_track
 
         if self._motion_tracker is not None:
+            # The tracker forgets a person not seen for track_expiry_seconds
+            # (1.0 s by default, tuned for several frames a second). At the
+            # pilot's 1 fps a sample arrives every 1.0 to 2 s, so every track
+            # expired between frames, "moving" never established, and the
+            # movement detectors could not fire on anyone (CHI, 19 Oct 2026:
+            # nobody ever tracked, zero movement alerts in two days). Hold a
+            # track for a few sampling intervals instead.
+            interval = float(getattr(self, "_detection_interval_s", 0.0) or 0.0)
+            if interval > 0.0:
+                self._motion_tracker.track_expiry_seconds = max(1.0, 3.0 * interval)
             motions = self._motion_tracker.update(
                 _person_boxes(tracked), timestamp, frame_hw,
                 zones_by_track=zones_by_track,
