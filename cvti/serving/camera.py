@@ -1244,6 +1244,36 @@ def rules_config_for(cam: dict) -> str:
     return str(cam.get("config") or DEFAULT_RULES_CONFIG)
 
 
+
+def resolve_camera_paths(cam: dict) -> dict:
+    """Make a camera's rules/zones file references usable wherever the engine runs.
+
+    A site file can name `configs/zones/x.json` relative to the source tree (the
+    Live EarthCams feed does). Installed, the engine's working directory is not
+    the bundle, so the path did not exist and the zones loader raised
+    FileNotFoundError on every Start (field report, 20 Oct 2026). A relative
+    path that is missing is retried against the bundled resources; a zones file
+    that exists nowhere is dropped with a warning instead of killing the engine
+    (a missing rules file was already only a warning)."""
+    from cvti.utils import resource_path
+    for key in ("config", "zones", "vehicle_zones"):
+        raw = cam.get(key)
+        if not raw or not isinstance(raw, str):
+            continue
+        path = Path(raw)
+        if path.exists():
+            continue
+        if not path.is_absolute():
+            bundled = resource_path(raw)
+            if bundled.exists():
+                cam[key] = str(bundled)
+                continue
+        if key != "config":
+            log.warning("camera %s: %s file not found (%s); running without it",
+                        cam.get("id"), key, raw)
+            cam.pop(key, None)
+    return cam
+
 def build_camera_states(site_config: dict, *, pose_model: Any = None, weapon_model: Any = None,
                         video_action_model: Any = None,
                         va_runner: Any = None,
@@ -1266,6 +1296,7 @@ def build_camera_states(site_config: dict, *, pose_model: Any = None, weapon_mod
 
     out: dict[str, dict] = {}
     for cam in site_config["cameras"]:
+        resolve_camera_paths(cam)
         cam_id = cam["id"]
         from cvti.detector.object_state import ObjectZoneMonitor
         object_state_zones = cam.get("object_state_zones", [])
@@ -1492,6 +1523,7 @@ def refresh_camera_rules(state: "PerCameraState", cam: dict,
     do. Attribute swaps are atomic in CPython: a frame in flight sees either
     the old engine or the new one, never a half-built one.
     """
+    resolve_camera_paths(cam)
     from cvti.retail.zones import RetailZoneMonitor, load_zone_config
     from cvti.detector.object_state import ObjectZoneMonitor
     policies = cam.get("object_state_zones", [])
