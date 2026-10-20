@@ -1439,7 +1439,10 @@ class AlertSink:
             # across the window (field report, 30 Aug).
             "clip_fps": float((alert.payload or {}).get("clip_fps") or 0.0) or None,
         }
-        if self.full_frame_provider is not None:
+        # save_evidence=False (site key store_evidence: false) means NO image of
+        # any kind: this full-resolution snapshot used to be written even then.
+        # The event's metadata (event.json) is not footage and is kept.
+        if self.save_evidence and self.full_frame_provider is not None:
             try:
                 full = self.full_frame_provider(alert.camera_id)
                 if full:

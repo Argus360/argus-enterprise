@@ -1424,7 +1424,12 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
     # Confirmed alerts are persisted (SQLite + evidence bundle) and notified,
     # instead of only printed. sink.handle is the gate's verdict callback.
     from cvti.serving.alert_sink import AlertSink, build_notifier
-    sink = AlertSink(output_dir, notifier=build_notifier(notify))
+    # store_evidence: false in the site file = no frames or clips are written
+    # for alerts (sites whose terms forbid recording off-premises).
+    store_evidence = site.get("store_evidence", True) is not False
+    if not store_evidence:
+        log.info("[site] store_evidence=false: alerts are recorded without images or clips")
+    sink = AlertSink(output_dir, notifier=build_notifier(notify), save_evidence=store_evidence)
     queue.on_generated = sink.audit_candidate_generated
     queue.on_admission = sink.audit_candidate_admission
     # W1.6: when detection rides a substream, the sink can still attach one
