@@ -128,9 +128,15 @@ const emptyTrackingPreferences = (): TrackingPreferenceState => ({
   overrides: {},
 });
 
+// True when this bundle is the one the engine serves over the tunnel (set by
+// `build:web`). Such a build has a real backend at its own origin even though
+// there is no Electron bridge, so it behaves like the desktop app for mode and
+// sign-in rather than falling back to the demo sandbox.
+const SERVED_BY_ENGINE = import.meta.env.VITE_ARGUS_SERVED === "1";
+
 export default function App() {
   const [mode, setMode] = useState<Mode>(() =>
-    initialMode(localStorage, Boolean(window.argusDesktop)),
+    initialMode(localStorage, Boolean(window.argusDesktop) || SERVED_BY_ENGINE),
   );
   const api = useMemo(() => client(mode), [mode]);
   const [view, setView] = useState<View>("watch");
@@ -626,7 +632,7 @@ export default function App() {
                 Sign in to connect the cameras, scene mapper and verification
                 engine.
               </p>
-              {!window.argusDesktop ? (
+              {!window.argusDesktop && !SERVED_BY_ENGINE ? (
                 <Notice>
                   The browser preview supports demo mode only. Launch the
                   Electron app to use the local engine.
