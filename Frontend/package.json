@@ -9,6 +9,7 @@
     "electron:compile": "tsc -p electron/tsconfig.json && node scripts/preload.cjs",
     "desktop": "npm run electron:compile && concurrently -k -s first \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && node scripts/launch.cjs\"",
     "build": "tsc -b && vite build && npm run electron:compile",
+    "build:web": "tsc -b && vite build --base=/ --outDir dist-web",
     "start": "node scripts/launch.cjs --production",
     "test": "vitest run",
     "test:ui": "playwright test",

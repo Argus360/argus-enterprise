@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from cvti.api import sources
 from cvti.api.tokens import TokenStore
@@ -65,11 +66,14 @@ async def _close_websocket_auth_denial(ws: WebSocket, code: int) -> None:
     await ws.close(code=code)
 
 
-def register_index(app: FastAPI, *, mock: bool = False) -> None:
+def register_index(app: FastAPI, *, mock: bool = False,
+                   serve_root: bool = True) -> None:
     """A self-describing root, so hitting the base URL isn't a bare 404.
 
     GET / and GET /api/v1 return the API's name, version, where the docs live,
-    and the live endpoint list — no auth, no data, just discovery.
+    and the live endpoint list — no auth, no data, just discovery. When a web
+    UI is mounted (serve_root=False), `/` belongs to the SPA and only the
+    /api/v1 discovery root is registered.
     """
     def _payload() -> dict:
         paths = sorted({
@@ -87,9 +91,10 @@ def register_index(app: FastAPI, *, mock: bool = False) -> None:
             "endpoints": paths,
         }
 
-    @app.get("/", include_in_schema=False)
-    async def root():
-        return _payload()
+    if serve_root:
+        @app.get("/", include_in_schema=False)
+        async def root():
+            return _payload()
 
     @app.get(API_PREFIX, include_in_schema=False)
     async def api_root():
@@ -97,7 +102,8 @@ def register_index(app: FastAPI, *, mock: bool = False) -> None:
 
 
 def create_app(*, db_path: str = "runs/site/events.db",
-               site_path: str = "configs/site_live.json") -> FastAPI:
+               site_path: str = "configs/site_live.json",
+               webui_dir: str = "") -> FastAPI:
     app = FastAPI(title="Argus Engine API", version="0.2.0")
     app.state.db_path = db_path
     app.state.site_path = site_path
@@ -304,12 +310,27 @@ def create_app(*, db_path: str = "runs/site/events.db",
     @app.get(f"{API_PREFIX}/camera-by-id/stream")
     @app.get(f"{API_PREFIX}/cameras/{{camera_id}}/stream")
     async def stream(camera_id: str, tracking: bool = False,
+                     proxy: bool = False,
                      principal=Depends(require_principal)):
+        # proxy=1: the viewer is a remote browser, not Electron on this box.
+        # Hand it a same-origin MJPEG URL routed through /cameras/{id}/mjpeg
+        # (which fronts the loopback publisher) instead of a 127.0.0.1 URL that
+        # would resolve to the viewer's own machine. WebRTC stays loopback-only
+        # (no TURN off-box), so proxy mode serves MJPEG.
         from cvti.security import permissions as perms
         from starlette.concurrency import run_in_threadpool
         perms.require(principal.role, perms.VIEW_LIVE)
 
         async def preview():
+            if proxy:
+                # The config-time preview runs its own loopback MJPEG server,
+                # which this box's /mjpeg proxy (engine publisher only) can't
+                # reach — and a 127.0.0.1 URL is useless to a remote browser.
+                # Return a retryable 503 so the tile waits for the engine rather
+                # than loading a dead URL. Remote live view is the running-engine
+                # path; proxying the engine-down preview is a later step.
+                return _error(503, "preview_unavailable",
+                              "Live stream not available yet; retry shortly")
             try:
                 result = await run_in_threadpool(
                     app.state.backend_host.call, principal, "camera_preview", camera_id=camera_id)
@@ -340,15 +361,19 @@ def create_app(*, db_path: str = "runs/site/events.db",
             # Per-camera port when the publisher made one (W1 wall): twelve
             # tiles on one origin queue behind the browser's six-per-host cap.
             port = (pub.get("ports") or {}).get(camera_id) or pub["port"]
-            mjpeg = (f"http://127.0.0.1:{port}/stream/"
-                     f"{quote(camera_id, safe='')}?{urlencode(query)}")
+            if proxy:
+                mjpeg = (f"{API_PREFIX}/cameras/{quote(camera_id, safe='')}"
+                         f"/mjpeg?{urlencode(query)}")
+            else:
+                mjpeg = (f"http://127.0.0.1:{port}/stream/"
+                         f"{quote(camera_id, safe='')}?{urlencode(query)}")
         except (OSError, ValueError, KeyError):
             pass
         # W1.4: the engine writes stream_gateway.json while go2rtc is up and
         # REMOVES it on stop — so this file existing IS the gateway being
         # alive, the same way frames.json works. The player switches on
         # `kind`; everything here is loopback-only by design.
-        if not tracking:
+        if not tracking and not proxy:
             try:
                 gw = json.loads((out_dir / "stream_gateway.json").read_text())
                 name = (gw.get("streams") or {}).get(camera_id)
@@ -366,6 +391,56 @@ def create_app(*, db_path: str = "runs/site/events.db",
         if mjpeg:
             return {"kind": "mjpeg", "url": mjpeg}
         return await preview()
+
+    @app.get(f"{API_PREFIX}/cameras/{{camera_id}}/mjpeg")
+    async def camera_mjpeg(camera_id: str, token: str = Query(...),
+                           tracking: bool = False):
+        # Same-origin MJPEG proxy for remote browsers. No bearer dependency on
+        # purpose: an <img src> tag cannot send an Authorization header, so this
+        # is a capability URL guarded by the per-run publisher token from
+        # frames.json (the same token the loopback /stream URL carries). The
+        # publisher stays bound to 127.0.0.1; only this proxy, behind the login
+        # wall and the tunnel, reaches it.
+        out_dir = Path(_db()).parent
+        try:
+            pub = json.loads((out_dir / "frames.json").read_text())
+        except (OSError, ValueError):
+            return _error(503, "stream_unavailable", "No live stream right now")
+        if not token or token != pub.get("token"):
+            raise HTTPException(status_code=403, detail="bad stream token")
+        port = (pub.get("ports") or {}).get(camera_id) or pub.get("port")
+        if not port:
+            return _error(503, "stream_unavailable", "No live stream right now")
+        query = {"token": pub["token"]}
+        if tracking:
+            query = {"tracking": 1, **query}
+        upstream = (f"http://127.0.0.1:{port}/stream/"
+                    f"{quote(camera_id, safe='')}?{urlencode(query)}")
+        import httpx
+        client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None))
+        try:
+            req = client.build_request("GET", upstream)
+            resp = await client.send(req, stream=True)
+        except httpx.HTTPError:
+            await client.aclose()
+            return _error(502, "stream_unavailable", "Live stream upstream error")
+        if resp.status_code != 200:
+            await resp.aclose()
+            await client.aclose()
+            return _error(502, "stream_unavailable", "Live stream upstream error")
+
+        async def body():
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            body(),
+            media_type=resp.headers.get("content-type",
+                                        "multipart/x-mixed-replace"))
 
     # ---- websocket ----------------------------------------------------------
     @app.websocket(f"{API_PREFIX}/stream")
@@ -489,8 +564,55 @@ def create_app(*, db_path: str = "runs/site/events.db",
             clip["pending"] = 0 <= age < CLIP_PENDING_WINDOW_S
         return clip
 
-    register_index(app, mock=False)
+    webui = _resolve_webui_dir(webui_dir)
+    register_index(app, mock=False, serve_root=webui is None)
+    if webui is not None:
+        _mount_webui(app, webui)
     return app
+
+
+def _resolve_webui_dir(webui_dir: str = "") -> Optional[Path]:
+    """The built web UI to serve at `/`, or None to stay API-only.
+
+    Order: the explicit argument, then ARGUS_WEBUI_DIR. A directory counts only
+    when it holds an index.html — a missing or half-built dir leaves the API
+    serving JSON at `/` exactly as before, so nothing here can break a headless
+    or Electron deployment.
+    """
+    candidate = webui_dir or os.environ.get("ARGUS_WEBUI_DIR", "")
+    if not candidate:
+        return None
+    path = Path(candidate).expanduser()
+    if (path / "index.html").is_file():
+        return path
+    log.warning("ARGUS web UI dir %s has no index.html; serving API only", path)
+    return None
+
+
+def _mount_webui(app: FastAPI, webui: Path) -> None:
+    """Serve the built single-page app at `/`, same-origin with the API.
+
+    Same origin means no CORS and the browser's bearer token reaches the API
+    over the tunnel unchanged. Real asset files are served from disk; every
+    other non-API GET falls back to index.html so client-side routes (deep
+    links like /incidents) load. API paths are never shadowed: they are
+    registered before this catch-all, and anything under /api/ that reaches
+    here is a genuine 404 answered as JSON, not as the app shell.
+    """
+    index = webui / "index.html"
+    root = webui.resolve()
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa(full_path: str = ""):
+        if full_path.startswith("api/") or full_path in ("api", "openapi.json"):
+            return _error(404, "not_found", f"no such path '/{full_path}'")
+        if full_path:
+            target = (root / full_path).resolve()
+            # Serve a real built file (JS/CSS/assets), but never escape the dir.
+            if (target == root or root in target.parents) and target.is_file():
+                return FileResponse(str(target))
+        return FileResponse(str(index))
 
 
 async def _send(ws: WebSocket, type_: str, data: Any) -> None:
