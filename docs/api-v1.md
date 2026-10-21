@@ -107,6 +107,16 @@ deleting a branch that still contains areas returns `409 conflict`.
 when the go2rtc gateway is up, else `{kind: "mjpeg", url}`. Players switch on
 `kind`; every URL is loopback-only by design.
 
+`GET /cameras/{id}/stream?proxy=1` (view_live): for a remote browser served the
+UI over a tunnel. Returns `{kind: "mjpeg", url}` where `url` is the same-origin
+path below instead of a 127.0.0.1 URL (which would mean the viewer's own
+machine); WebRTC is skipped since it has no off-box path.
+
+`GET /cameras/{id}/mjpeg?token=…` (view_live via the per-run publisher token in
+the query, so an `<img>` tag can load it): same-origin MJPEG proxy. Streams the
+loopback frame publisher back to the browser; the publisher itself stays bound
+to 127.0.0.1.
+
 ### Zones
 
 | Bridge method | Endpoint | Permission | Status |

@@ -19,6 +19,9 @@ def main() -> None:
                    help="path to the site config")
     p.add_argument("--mock", action="store_true",
                    help="serve canned data — no engine, no cameras")
+    p.add_argument("--webui-dir", default="",
+                   help="serve a built web UI (Frontend/dist) at / , same-origin "
+                        "with the API; also settable via ARGUS_WEBUI_DIR")
     args = p.parse_args()
 
     import uvicorn
@@ -30,7 +33,8 @@ def main() -> None:
               "— any username/password works")
     else:
         from cvti.api.app import create_app
-        app = create_app(db_path=args.db, site_path=args.site)
+        app = create_app(db_path=args.db, site_path=args.site,
+                         webui_dir=args.webui_dir)
         print(f"[argus-api] on http://{args.host}:{args.port}/api/v1  "
               f"(db={args.db}, site={args.site})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

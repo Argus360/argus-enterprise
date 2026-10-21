@@ -56,6 +56,27 @@ function loopbackUrl(value: unknown, protocols: string[]): string {
   return parsed.toString();
 }
 
+// Remote-browser (proxy) mode: the API returns a same-origin, root-relative
+// MJPEG path (/api/v1/cameras/<id>/mjpeg?token=...) that the browser resolves
+// against its own origin — the tunnel host — instead of a 127.0.0.1 URL. Only
+// a root-relative path is accepted so a hostile descriptor can't aim the <img>
+// at another origin. WebRTC never reaches here: proxy mode asks for MJPEG.
+function sameOriginStreamUrl(value: unknown): string {
+  if (typeof value !== "string" || !value.startsWith("/") ||
+      value.startsWith("//"))
+    throw new Error("unsafe stream descriptor URL");
+  return value;
+}
+
+function normalizeProxyStreamDescriptor(value: any) {
+  if (!value || typeof value !== "object")
+    throw new Error("unsafe stream descriptor shape");
+  if (value.kind === "mjpeg")
+    return { kind: "mjpeg", url: sameOriginStreamUrl(value.url),
+      ...(value.preview === true ? { preview: true } : {}) };
+  throw new Error("unsafe stream descriptor kind");
+}
+
 function normalizeStreamDescriptor(value: any) {
   if (!value || typeof value !== "object")
     throw new Error("unsafe stream descriptor shape");
@@ -532,14 +553,24 @@ export class ArgusApiClient {
       fetch?: typeof fetch;
       WebSocket?: typeof WebSocket;
       onToken?: (token: string) => void;
+      // "loopback" (default, Electron on the same box) hands the UI 127.0.0.1
+      // stream URLs; "proxy" (remote browser) hands it same-origin MJPEG URLs
+      // routed through the API, since 127.0.0.1 would mean the viewer's machine.
+      streamMode?: "loopback" | "proxy";
+      // A bearer token kept from an earlier page load, so a browser refresh
+      // doesn't force a re-login while the 12h token is still valid.
+      initialToken?: string;
     } = {},
   ) {
     this.fetchImpl = options.fetch ?? fetch;
     this.WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
     this.onToken = options.onToken;
+    this.streamMode = options.streamMode ?? "loopback";
+    this.token = options.initialToken || undefined;
   }
 
   private readonly onToken?: (token: string) => void;
+  private readonly streamMode: "loopback" | "proxy";
 
   async invoke<T>(method: string, args: unknown[] = []): Promise<T> {
     if (!Array.isArray(args)) throw new Error("Invalid operation arguments");
@@ -587,6 +618,23 @@ export class ArgusApiClient {
       throw new Error(
         "Live streams are resolved per camera through camera_stream.",
       );
+    if (method === "camera_stream" && this.streamMode === "proxy") {
+      // Ask the API for a same-origin proxy URL (proxy=1) and accept the
+      // relative MJPEG path it returns, rather than a loopback descriptor.
+      return (await this.request(
+        {
+          method: "GET",
+          path: item("/cameras", "/stream"),
+          query: ([, tracking = false]) => ({
+            tracking: tracking === true,
+            proxy: true,
+          }),
+          normalize: normalizeProxyStreamDescriptor,
+        },
+        args,
+        true,
+      )) as T;
+    }
     const operation = operations[method];
     if (!operation) throw new Error(`Unsupported engine operation: ${method}`);
     return (await this.request(operation, args, true)) as T;
