@@ -73,6 +73,11 @@ datas.append((_version_file, "."))
 # anything is off, and a fallback that is not in the bundle is a lie.
 for pattern, dest in (("models/*.pt", "models"), ("models/*.onnx", "models"),
                       ("configs/*.json", "configs"),
+                      # rules and zones the app's built-in feeds point at
+                      # (Live EarthCams: configs/rules|zones/live_watch.json);
+                      # absent, the engine started without them or not at all.
+                      ("configs/rules/*.json", "configs/rules"),
+                      ("configs/zones/*.json", "configs/zones"),
                       ("configs/*.yaml", "configs"), ("prompts/*.txt", "prompts"),
                       ("schemas/*.json", "schemas")):
     import glob as _glob
