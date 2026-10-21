@@ -1880,6 +1880,12 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
         # Link state per camera, so the UI shows coverage rather than inferring
         # it from the absence of alerts.
         cameras = [d.link_status() for d in pipe._decoders.values()]
+        # What detection saw per camera (counts only), so "is it detecting"
+        # is a number in health and in the heartbeat, not a walk test.
+        from cvti.serving.camera import detection_status
+        for row in cameras:
+            st = states.get(row.get("camera_id"))
+            row["detection"] = detection_status(st) if st is not None else None
         # Per-component counters. Without these, "this detector found nothing"
         # and "this detector has thrown on every frame for a week" are the same
         # silence.

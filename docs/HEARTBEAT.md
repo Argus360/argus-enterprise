@@ -48,7 +48,8 @@ if anyone can check what it sends.*
 |---|---|
 | `site_id` | The site's name, slugified. Chosen by the owner. |
 | `status`, `reasons` | The health verdict and why. Reasons name cameras and components, never people or events. |
-| `cameras[]` | Link state and frame freshness per camera. **No image data.** |
+| `cameras[]` | Link state, frame freshness and detection counts per camera: frames the model looked at, frames with a person, seconds since a person was last seen. **No image data.** |
+| `version` | The engine build that wrote the heartbeat. |
 | `gate` | Verification counts and latency. **Not** what was verified. |
 | `disk`, `memory` | Headroom, so a filling disk is caught before recording stops. |
 | `components[]` | Error counters per detector. Counts only. |
