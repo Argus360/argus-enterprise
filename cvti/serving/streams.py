@@ -42,6 +42,14 @@ OFFLINE = "offline"
 # reboot or a network blip does not page anyone.
 DEFAULT_OFFLINE_GRACE = 60.0
 
+# How long a LIVE stream may return failed reads before we treat it as dropped
+# and reopen the RTSP connection. A lossy 4MP HEVC stream over a WAN returns a
+# bad read on every corrupted frame while the connection itself is fine; tearing
+# down and reopening on the first one makes the camera flap (CHI, 21 Oct 2026:
+# 7 reconnects/min on the heaviest stream). We instead skip the bad frame and
+# keep reading, and only reconnect once no good frame has arrived for this long.
+DEFAULT_READ_FAIL_GRACE = 3.0
+
 
 
 class PushGovernor:
@@ -153,6 +161,7 @@ class StreamDecoder:
     def __init__(self, camera_id: str, source: int | str, *, target_fps: float = 5.0,
                  reconnect: bool = True, reconnect_backoff: float = 1.0,
                  loop_files: bool = True, offline_grace_seconds: float = DEFAULT_OFFLINE_GRACE,
+                 read_fail_grace_seconds: float = DEFAULT_READ_FAIL_GRACE,
                  on_state_change=None, view_only: bool = False,
                  fallback_source: int | str | None = None,
                  relay_retry_seconds: float = 60.0,
@@ -312,6 +321,7 @@ class StreamDecoder:
         self.ended = False
         self.reconnects = 0            # how many times we've re-opened a live stream
         self.offline_grace_seconds = offline_grace_seconds
+        self.read_fail_grace_seconds = read_fail_grace_seconds
         self.on_state_change = on_state_change
         self.state = CONNECTED
         self.state_since = time.time()
@@ -722,6 +732,18 @@ class StreamDecoder:
                 if not self.stream_width:
                     self.stream_height, self.stream_width = image.shape[:2]
             if not ok:
+                # Tolerate transient decode failures on a live stream. A lossy
+                # HEVC feed returns a bad read on a corrupted frame while the
+                # connection is fine; as long as a good frame arrived within the
+                # grace window, skip this one and keep reading rather than tear
+                # down and reopen RTSP (which is what made the WAN cameras flap).
+                # A genuine drop stops delivering good frames, so last_frame_at
+                # ages past the grace and we fall through to the reconnect below.
+                if (self.reconnect and self._is_live() and self.last_frame_at
+                        and time.time() - self.last_frame_at
+                        < self.read_fail_grace_seconds):
+                    self._stop.wait(0.03)   # don't busy-spin on repeated bad reads
+                    continue
                 if self.reconnect and self._is_live():
                     # Live source dropped (camera reboot / network blip). Keep
                     # reopening with an exponential, capped backoff until it
