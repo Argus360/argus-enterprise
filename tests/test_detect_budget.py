@@ -58,7 +58,7 @@ class Config(unittest.TestCase):
         cfg = AdaptiveConfig.from_site(True)
         self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.floor_fps, 6.0)
-        self.assertEqual(cfg.ceiling_fps, 30.0)
+        self.assertEqual(cfg.ceiling_fps, 120.0)   # GPU-bound, not a fixed cap
 
     def test_dict_overrides_and_clamps(self):
         cfg = AdaptiveConfig.from_site({"floor_fps": 10, "ceiling_fps": 40,
@@ -110,3 +110,38 @@ class Controller(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoopPeriodFollowsTheController(unittest.TestCase):
+    """_loop_period: the run loop must keep up with the adaptive target, so the
+    rate is bounded by GPU/stream, not a fixed 0.15s tick (the old hidden cap)."""
+
+    def _pipe(self, adaptive, cam_targets):
+        from cvti.serving.pipeline import MultiStreamPipeline
+        p = MultiStreamPipeline.__new__(MultiStreamPipeline)
+        p.tick_seconds = 0.15
+        p._adaptive = adaptive
+        p._cam_target_fps = cam_targets
+        return p
+
+    def test_fixed_tick_when_adaptive_off(self):
+        self.assertAlmostEqual(self._pipe(None, {})._loop_period(), 0.15)
+
+    def test_fixed_tick_until_controller_sets_rates(self):
+        ctrl = object()
+        self.assertAlmostEqual(self._pipe(ctrl, {})._loop_period(), 0.15)
+
+    def test_speeds_up_to_serve_the_highest_target(self):
+        ctrl = object()
+        # want 25 fps -> period 0.04s, well under the 0.15 fixed tick
+        self.assertAlmostEqual(self._pipe(ctrl, {"a": 25.0})._loop_period(), 0.04)
+
+    def test_never_busy_spins_below_the_floor(self):
+        ctrl = object()
+        # want 1000 fps -> clamped to the 0.01s (100 loops/s) floor
+        self.assertAlmostEqual(self._pipe(ctrl, {"a": 1000.0})._loop_period(), 0.01)
+
+    def test_never_slower_than_the_fixed_tick(self):
+        ctrl = object()
+        # a low target must not make the loop sleep longer than tick_seconds
+        self.assertAlmostEqual(self._pipe(ctrl, {"a": 2.0})._loop_period(), 0.15)

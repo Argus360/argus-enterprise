@@ -830,6 +830,26 @@ class MultiStreamPipeline:
             return True
         return False
 
+    # Never spin faster than this (100 loops/s) — a floor on the loop period so
+    # a high adaptive target can't turn the run loop into a busy-wait.
+    _MIN_LOOP_PERIOD_S = 0.01
+
+    def _loop_period(self) -> float:
+        """How long the run loop sleeps between batches.
+
+        Fixed at tick_seconds normally. With the adaptive controller on, the loop
+        instead keeps up with the HIGHEST per-camera target it has set, so the
+        detection rate is bounded by GPU headroom and the stream — not by a fixed
+        loop period (the old 0.15s tick silently capped a single camera at ~7fps,
+        however high the ceiling). The controller itself holds GPU use near its
+        target, so ticking faster here cannot run the card away."""
+        if self._adaptive is None or not self._cam_target_fps:
+            return self.tick_seconds
+        want = max(self._cam_target_fps.values(), default=0.0)
+        if want <= 0:
+            return self.tick_seconds
+        return max(self._MIN_LOOP_PERIOD_S, min(self.tick_seconds, 1.0 / want))
+
     def _tick_adaptive(self, now: float) -> None:
         """Re-size the per-camera detection rates once per window.
 
@@ -1127,7 +1147,7 @@ class MultiStreamPipeline:
             if self._all_ended():
                 log.info("[serving] all streams ended")
                 break
-            slept = self.tick_seconds - (time.perf_counter() - tick)
+            slept = self._loop_period() - (time.perf_counter() - tick)
             if slept > 0:
                 time.sleep(slept)
         self._report(final=True)

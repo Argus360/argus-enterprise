@@ -83,13 +83,16 @@ def allocate_detection_fps(cameras: list[DetectCamera], *, budget_fps: float,
 class AdaptiveConfig:
     """Operator-facing knobs, read from the site file's `adaptive_fps` block.
 
-    Defaults are tuned for a single modern GPU (e.g. a T4) running a handful of
-    cameras: a 6 fps floor so no camera is ever starved, a 30 fps ceiling so a
-    single busy camera can't monopolise, and a 70% busy target that keeps the
-    GPU well-fed without saturating (which would add queueing latency)."""
+    Defaults are tuned for a single modern GPU (e.g. a T4): a 6 fps floor so no
+    camera is ever starved, a high ceiling so the real upper bound is GPU
+    headroom and the stream's own frame rate rather than a fixed number (the
+    controller holds GPU use near target_busy, so it self-limits long before the
+    ceiling), and a 70% busy target that keeps the GPU well-fed without
+    saturating. The ceiling only matters as a guard in busy multi-camera sites;
+    lower it there if one camera should never monopolise."""
     enabled: bool = False
     floor_fps: float = 6.0
-    ceiling_fps: float = 30.0
+    ceiling_fps: float = 120.0
     target_busy: float = 0.70
     window_s: float = 2.0
     # Largest multiplicative change to the budget per window — damps oscillation
