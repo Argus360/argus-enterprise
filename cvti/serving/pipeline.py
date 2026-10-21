@@ -29,6 +29,8 @@ from typing import Any, Callable
 from cvti.contracts import LOCAL_VLM_MODEL
 from cvti.serving.alert_queue import QueuedAlert
 from cvti.serving.batcher import collect_batch
+from cvti.serving.detect_budget import (AdaptiveConfig, DetectCamera,
+                                        DetectionRateController)
 from cvti.serving.frame_publisher import FrameOverlay
 from cvti.serving.streams import Frame, StreamDecoder
 from cvti.logging_setup import get_logger
@@ -472,7 +474,8 @@ class MultiStreamPipeline:
                  detector_threads: int | None = None,
                  keyframe_cost_share: float = 0.25,
                  wall_decode_budget_ms: float | None = None,
-                 keyframe_min_fps: float = 0.5) -> None:
+                 keyframe_min_fps: float = 0.5,
+                 adaptive_fps: "AdaptiveConfig | None" = None) -> None:
         # CPU share of one core, measured over fixed windows, above which an
         # eligible stream switches to keyframe-only decode under the "auto"
         # policy (see StreamDecoder).
@@ -535,6 +538,18 @@ class MultiStreamPipeline:
         self.latest_zones: dict = {}       # camera_id -> {track_id: (zone, ...)} this frame
         self._smooth_thread = None
         self._last_detect: dict = {}       # camera_id -> last model-sample time
+        # Adaptive detection rate (off unless the site enables it). When on, a
+        # controller rewrites a per-camera target each window from GPU headroom
+        # and per-camera activity; _due_for_detection reads _cam_target_fps and
+        # falls back to the fixed self.target_fps for any camera not yet sized.
+        self._adaptive_cfg = adaptive_fps or AdaptiveConfig(enabled=False)
+        self._adaptive = DetectionRateController(
+            self._adaptive_cfg, budget_fps=max(1.0, float(target_fps)) * 1.0,
+        ) if self._adaptive_cfg.enabled else None
+        self._cam_target_fps: dict[str, float] = {}
+        self._activity_count: Counter = Counter()   # detections per cam this window
+        self._adapt_last_wall = 0.0
+        self._adapt_last_detect_ms = 0.0
         # General-object lifecycle uses monotonic observation time. Generation
         # and tracker update/reset share this lock so an inference started on an
         # old source can never re-enter continuity after a reconnect reset.
@@ -801,13 +816,53 @@ class MultiStreamPipeline:
                 time.sleep(sleep)
 
     def _due_for_detection(self, camera_id: str, now: float) -> bool:
-        """Detection samples at target_fps even when decoders run faster for
-        the live wall — without this gate, faster decode = 2-3x model load."""
+        """Detection samples at the camera's target fps even when decoders run
+        faster for the live wall — without this gate, faster decode = 2-3x model
+        load. The rate is the adaptive per-camera target when the controller is
+        on, else the fixed self.target_fps."""
+        cam_rates = getattr(self, "_cam_target_fps", None)
+        rate = (cam_rates.get(camera_id) if cam_rates else None) or self.target_fps
+        if rate <= 0:
+            rate = self.target_fps
         last = self._last_detect.get(camera_id, 0.0)
-        if now - last >= 0.95 / self.target_fps:
+        if now - last >= 0.95 / rate:
             self._last_detect[camera_id] = now
             return True
         return False
+
+    def _tick_adaptive(self, now: float) -> None:
+        """Re-size the per-camera detection rates once per window.
+
+        Busy fraction = detection milliseconds / real milliseconds since the last
+        tick. The controller grows the shared budget when the GPU has headroom
+        and shrinks it when detection is eating most of real time, then splits it
+        across cameras by the detections each produced this window (the activity
+        signal). Cheap and best-effort: any error leaves the current rates in
+        place rather than disturbing the frame loop."""
+        if self._adaptive is None:
+            return
+        if self._adapt_last_wall == 0.0:          # first call: start the window
+            self._adapt_last_wall = now
+            self._adapt_last_detect_ms = self._detect_ms_total
+            return
+        elapsed = now - self._adapt_last_wall
+        if elapsed < self._adaptive_cfg.window_s:
+            return
+        try:
+            detect_ms = self._detect_ms_total - self._adapt_last_detect_ms
+            busy = detect_ms / (elapsed * 1000.0) if elapsed > 0 else 0.0
+            cam_ids = [c for c in self._decoders if c not in self.view_only]
+            cameras = [DetectCamera(cid, float(self._activity_count.get(cid, 0)) / elapsed)
+                       for cid in cam_ids]
+            if cameras:
+                self._cam_target_fps = self._adaptive.update(
+                    busy_fraction=busy, cameras=cameras)
+        except Exception:  # noqa: BLE001 - never let budgeting break detection
+            log.debug("adaptive fps tick failed", exc_info=True)
+        finally:
+            self._adapt_last_wall = now
+            self._adapt_last_detect_ms = self._detect_ms_total
+            self._activity_count.clear()
 
     def _handle_link_change(self, camera_id: str, previous: str,
                             state_name: str, held: float) -> None:
@@ -1053,11 +1108,19 @@ class MultiStreamPipeline:
                 BOARD.observe("detect_batch", "engine", batch_ms, units=len(batch))
                 for frame, result in zip(batch, results):
                     self.on_result(frame, result)
+                    if self._adaptive is not None:
+                        # Activity = detections seen this window; drives the
+                        # per-camera split in _tick_adaptive.
+                        boxes = getattr(result, "boxes", None)
+                        self._activity_count[frame.camera_id] += (
+                            0 if boxes is None else len(boxes))
                 for frame in batch[len(results):]:
                     self._inference_context.pop(id(frame), None)
                 self.batches += 1
                 self.frames_processed += len(batch)
                 self.batch_hist[len(batch)] += 1
+            if self._adaptive is not None:
+                self._tick_adaptive(time.perf_counter())
             if time.perf_counter() - last_report >= 3.0:
                 self._report()
                 last_report = time.perf_counter()
@@ -1589,7 +1652,8 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
                                wall_decode_budget_ms=(float(site["wall_decode_budget_ms"])
                                                       if isinstance(site.get("wall_decode_budget_ms"), (int, float))
                                                       and not isinstance(site.get("wall_decode_budget_ms"), bool)
-                                                      and site["wall_decode_budget_ms"] > 0 else None))
+                                                      and site["wall_decode_budget_ms"] > 0 else None),
+                               adaptive_fps=AdaptiveConfig.from_site(site.get("adaptive_fps")))
 
     def _fast_path(alert) -> None:
         """Two-tier alerting (EP-06-T4): criticals are shown provisionally the
