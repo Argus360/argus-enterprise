@@ -131,11 +131,17 @@ class WiringPins(unittest.TestCase):
         self.assertIn("d.display_fps", src)
 
     def test_detection_stays_gated_at_target_fps(self):
-        """Smooth glass must never mean more model load."""
+        """Smooth glass must never mean more model load.
+
+        Detection is gated at the camera's effective rate — the adaptive
+        per-camera target when the controller is on, and self.target_fps as the
+        fallback when it is off. The gate itself (0.95 / rate) and that fixed
+        fallback are both pinned so faster decode can never lift model load."""
         import inspect
         from cvti.serving import pipeline
-        self.assertIn("0.95 / self.target_fps",
-                      inspect.getsource(pipeline.MultiStreamPipeline._due_for_detection))
+        src = inspect.getsource(pipeline.MultiStreamPipeline._due_for_detection)
+        self.assertIn("0.95 / rate", src)
+        self.assertIn("or self.target_fps", src)
 
 
 class PublishRateDefaults(unittest.TestCase):
