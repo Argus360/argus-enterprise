@@ -131,10 +131,18 @@ class LoopPeriodFollowsTheController(unittest.TestCase):
         ctrl = object()
         self.assertAlmostEqual(self._pipe(ctrl, {})._loop_period(), 0.15)
 
-    def test_speeds_up_to_serve_the_highest_target(self):
+    def test_speeds_up_to_serve_a_single_target(self):
         ctrl = object()
-        # want 25 fps -> period 0.04s, well under the 0.15 fixed tick
+        # one camera wanting 25 fps -> period 0.04s, well under the 0.15 fixed tick
         self.assertAlmostEqual(self._pipe(ctrl, {"a": 25.0})._loop_period(), 0.04)
+
+    def test_ticks_at_the_SUM_across_cameras(self):
+        ctrl = object()
+        # four cameras each wanting 20 fps -> the loop must tick at 80/s (0.0125s),
+        # not at 1/20=0.05s (which gave each camera a quarter of its target).
+        self.assertAlmostEqual(
+            self._pipe(ctrl, {"a": 20.0, "b": 20.0, "c": 20.0, "d": 20.0})._loop_period(),
+            1.0 / 80)
 
     def test_never_busy_spins_below_the_floor(self):
         ctrl = object()
