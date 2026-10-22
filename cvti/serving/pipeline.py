@@ -1620,18 +1620,35 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
         output_dir, cameras=[str(c.get("id")) for c in site.get("cameras") or []])
         if publish_frames else None)
 
+    _offline_alerted: set[str] = set()   # cameras we've raised an OFFLINE alert for
+
     def _on_link_change(cam_id: str, previous: str, state: str, held: float) -> None:
         """A camera going offline raises its own alert through normal routing.
 
         Without this the customer believes they have coverage they do not have:
         an unreachable camera produces no alerts, which is indistinguishable
         from a camera watching a quiet area.
+
+        Only a REAL outage is worth an alert. A camera reaches OFFLINE only after
+        offline_grace (60s) of failed reconnects, so that fires once per genuine
+        outage. "Recovered" then fires once to clear it. A brief WAN blip that
+        reconnects before OFFLINE is not an outage and must stay silent — firing
+        "recovered" on every >1s blink is what buried the feed in hundreds of
+        auto-confirmed, unverified INFO alerts (CHI, 22 Oct 2026).
         """
         from cvti.serving.streams import CONNECTED, OFFLINE
-        if state not in (OFFLINE, CONNECTED) or (state == CONNECTED and previous == "reconnecting"
-                                                 and held < 1.0):
+        if state == OFFLINE:
+            if cam_id in _offline_alerted:
+                return                      # already alerted this outage
+            _offline_alerted.add(cam_id)
+            offline = True
+        elif state == CONNECTED:
+            if cam_id not in _offline_alerted:
+                return                      # a blip that never reached OFFLINE — silent
+            _offline_alerted.discard(cam_id)
+            offline = False
+        else:
             return
-        offline = state == OFFLINE
         queue.add(QueuedAlert(
             camera_id=cam_id,
             rule_name="camera_offline" if offline else "camera_recovered",
