@@ -14,9 +14,13 @@ class ConcealmentNotices:
         candidate = (alert.payload or {}).get("candidate")
         if getattr(candidate, "detector", "") != "concealment":
             return
+        # Remember the candidate so its verdict can find it, but show nothing
+        # yet: an unverified gesture on the live tile ("Possible product
+        # concealment - Verifying") read as an accusation the VLM then usually
+        # withdrew (CHI, 22 Oct 2026). Only a confirmed or inconclusive verdict
+        # puts a notice on the camera; a rejected one never appears.
         token = uuid.uuid4().hex
         alert.payload["concealment_notice_id"] = token
-        self._set(alert.camera_id, token, "verifying")
 
     def verdict(self, alert, result):
         token = (alert.payload or {}).get("concealment_notice_id")
