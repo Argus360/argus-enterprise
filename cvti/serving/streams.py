@@ -606,6 +606,9 @@ class StreamDecoder:
         want = self._wants_keyframes()
         cap = open_capture(self.source, keyframes_only=want)
         self._cap_keyframes = bool(getattr(cap, "keyframes_only", False))
+        # An ffmpeg-fed capture (GPU decode) pushes frames at the stream's own
+        # rate; the loop must read as they arrive and never sleep between reads.
+        self._cap_push = bool(getattr(cap, "push_source", False))
         self._cap = cap
         self.codec = self._codec_of(cap) or self.codec
         self.achieved_fps = None               # a new capture: measure its rate afresh
@@ -676,6 +679,12 @@ class StreamDecoder:
                 # minutes). Every keyframe is read the moment it arrives;
                 # the detector still samples at its own rate downstream.
                 stride = 1
+                self._min_period = 0.0
+            elif getattr(self, "_cap_push", False):
+                # GPU decode via ffmpeg: every frame is already decoded and
+                # pushed at stream rate. Keep the stride (grab() just drains the
+                # socket), but never sleep — a paused reader backs the socket up
+                # until ffmpeg stalls on its RTSP input and the stream drops.
                 self._min_period = 0.0
             if self.playout is not None:
                 # Playout pops at content rate; a boosted camera's content

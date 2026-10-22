@@ -834,6 +834,31 @@ class MultiStreamPipeline:
     # a high adaptive target can't turn the run loop into a busy-wait.
     _MIN_LOOP_PERIOD_S = 0.01
 
+    # Decoders keep a little more than the detection rate so the detection gate
+    # (0.95 of the period) always finds a fresh frame, never one tick stale.
+    _DECODE_HEADROOM = 1.25
+
+    def _sync_decoder_rates(self) -> None:
+        """Decode each camera at ITS adaptive detection rate.
+
+        Decoders start at the fixed target_fps (detection rate, not publish rate:
+        an unwatched camera must not be decoded flat out). Once the controller
+        sizes a camera, its decoder follows that rate — otherwise the service's
+        --target-fps 8 capped every camera at ~8-10 fps and the controller's
+        floor could never be met (CHI, 22 Oct 2026). The decoder's own
+        measured-sustainable cap and the viewer boost still apply."""
+        for cam_id, rate in self._cam_target_fps.items():
+            decoder = self._decoders.get(cam_id)
+            if decoder is not None and rate > 0:
+                want = rate * self._DECODE_HEADROOM
+                # Never ask a decoder for more than the camera sends: a 30fps
+                # stream asked for 150 reads as "this machine can't keep up"
+                # and logs a false decode-limit warning on every window.
+                source_fps = float(getattr(decoder, "_fps", 0.0) or 0.0)
+                if source_fps > 1.0:
+                    want = min(want, source_fps)
+                decoder.target_fps = max(float(self.target_fps), want)
+
     def _loop_period(self) -> float:
         """How long the run loop sleeps between batches.
 
@@ -880,6 +905,7 @@ class MultiStreamPipeline:
             if cameras:
                 self._cam_target_fps = self._adaptive.update(
                     busy_fraction=busy, cameras=cameras)
+                self._sync_decoder_rates()
         except Exception:  # noqa: BLE001 - never let budgeting break detection
             log.debug("adaptive fps tick failed", exc_info=True)
         finally:
