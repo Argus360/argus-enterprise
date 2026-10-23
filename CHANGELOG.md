@@ -4,6 +4,63 @@ What changed in each release, written for the person who has to decide whether
 to update. Dates are release dates. Every version is built by CI from a tag on
 `main` and published with SHA-256 sums — verify your download against them.
 
+## v1.11.0 — 23 Oct 2026
+
+The CHI engineering loop: one change, one 60-second measurement on the live
+Azure server, keep or revert. Four 4MP HEVC cameras went from 4–5 detections
+a second each with a flapping link to 15–18 a second each, 4/4 up, zero
+reconnects in an hour — and the alerts you see are now only the ones the
+verifier agreed with.
+
+**Detection rate is dynamic and uncapped.** The engine's main loop used to
+tick at the slowest camera's rate, so with four cameras it ran four times
+slower than it could. It now ticks at the sum of the per-camera targets, and
+an adaptive controller hands each camera more frames when it is busy and
+there is GPU headroom, down to a floor when it is idle. Decoders follow the
+controller instead of a fixed `--target-fps`, up to what the camera sends.
+
+**Video decodes on the GPU.** Live HEVC/H.264 goes through NVDEC (ffmpeg
+`hevc_cuvid`) and is scaled in the decoder, so the CPU no longer spends its
+time unpacking 4MP frames. Set `ARGUS_NVDEC=0` to fall back to the CPU path,
+`ARGUS_NVDEC_MAX_WIDTH` to choose the decoded width (default 1600).
+
+**A failed read is not a dead camera.** One failed decode used to tear the
+stream down and reconnect, which on a strained uplink meant a reconnect
+every few seconds. A stream that delivered a frame in the last three seconds
+now just retries. Camera outage alerts fire once per real outage;
+one-second blips are silent (a morning at CHI had 584 "camera recovered"
+alerts).
+
+**Only verified alerts reach the Incidents table.** A provisional alert the
+verifier rejects is retracted and no longer listed in incidents or triage,
+and the "Possible product concealment · Verifying" tile banner is gone — a
+banner appears only once there is a verdict. `verify_bypass: []` in the site
+file sends every detector through the verifier, including violence.
+
+**Lying down is not a fall.** The fall detector fired on anyone wider than
+tall for four frames — someone on the floor, crouching, or bending over a
+pallet. It now needs the same person to have been upright within 2.5
+seconds of going down.
+
+**Work that isn't per-frame no longer costs per-frame.** Tamper and
+fire/smoke sample at 2 Hz, the tamper measure runs on a 320-pixel
+downscale, the pose and weapon pass has a per-camera time budget
+(`heavy_min_interval_s`, 0.5 s), and the replay clip encoder is skipped
+when the site keeps no evidence.
+
+**The app runs in a browser from the engine's own server.** The API serves
+the built web UI (`--webui-dir`) and proxies live video on the same origin,
+so a co-founder on a laptop sees the same cameras, incidents and settings as
+the desktop app — no Electron needed. The browser build defaults to the
+live API, not demo mode.
+
+**Also:** per-camera detection counts in health and the heartbeat (#259);
+`store_evidence=false` records alerts without any image (#261); a camera's
+missing zones file no longer kills the engine (#260). Operators note: the
+person model is a service flag (`--weights`); CHI runs `yolov8s` with
+`yolov8m` on its haziest camera via a per-camera `detection_inference`
+block, which found three people where the default nano model found one.
+
 ## v1.10.13 — 19 Oct 2026
 
 Two fixes from CHI's own logs, both about alerts that could never arrive.
