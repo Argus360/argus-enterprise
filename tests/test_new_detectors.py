@@ -16,8 +16,10 @@ from cvti.detector.fall import FallDetector
 
 class FallTests(unittest.TestCase):
     def test_horizontal_person_fires(self):
+        # A fall is a transition: the person was upright, then went down.
         det = FallDetector(min_frames=3)
         res = None
+        det.update([(1, 80, 10, 120, 180)], frame_area=200 * 200, timestamp=-0.25)
         for i in range(6):
             res = det.update([(1, 10, 100, 210, 160)], frame_area=200 * 200, timestamp=i * 0.25) or res
         self.assertIsNotNone(res)

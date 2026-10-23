@@ -96,10 +96,15 @@ class ClipBufferTests(unittest.TestCase):
     def test_the_frame_loop_fills_the_buffer_through_the_capped_encoder(self):
         import inspect
         from cvti.serving import camera
+        # The frame loop records through _record_clip_frame (which can skip
+        # the encode when evidence is off); the encode itself stays capped.
         src = inspect.getsource(camera.PerCameraState.process)
-        self.assertIn("encode_clip_frame", src)
+        self.assertIn("self._record_clip_frame(image, timestamp)", src)
+        rec = inspect.getsource(camera.PerCameraState._record_clip_frame)
+        self.assertIn("encode_clip_frame", rec)
         # The raw full-res encode must not sneak back onto the hot path.
         self.assertNotIn('cv2.imencode(".jpg", image', src)
+        self.assertNotIn('cv2.imencode(".jpg", image', rec)
 
     def test_gate_evidence_stays_full_resolution(self):
         """D4 shrinks REPLAY, never evidence: the frames the gate judges and
