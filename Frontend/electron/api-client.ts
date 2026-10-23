@@ -562,7 +562,11 @@ export class ArgusApiClient {
       initialToken?: string;
     } = {},
   ) {
-    this.fetchImpl = options.fetch ?? fetch;
+    // Bind to the global: a bare `fetch` stored on the instance and called as
+    // this.fetchImpl(...) runs with `this` = the client, which the browser
+    // rejects as an "Illegal invocation". Electron passes its own fetch, so the
+    // fallback only bites in the browser bundle.
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
     this.onToken = options.onToken;
     this.streamMode = options.streamMode ?? "loopback";
