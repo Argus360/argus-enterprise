@@ -29,6 +29,15 @@ class FallDetector:
         # seen upright within `upright_within_s` of its first down frame.
         # 0 disables the transition requirement (old static behaviour).
         upright_within_s: float = 2.5,
+        # Fallen people don't travel. An overhead camera foreshortens anyone
+        # walking underneath it into a "wide" box that keeps moving across
+        # the floor (CHI Warehouse, 23 Oct 2026: a worker passing under the
+        # lens was confirmed as a collapse). If the box centre travels faster
+        # than `max_travel_rate` box-sizes per second during the down streak,
+        # it is a person in motion, not on the ground. Frame-rate independent:
+        # a walker covers about one box width a second, a body covers none.
+        # 0 disables.
+        max_travel_rate: float = 0.5,
     ) -> None:
         self.down_aspect = down_aspect
         self.up_aspect = up_aspect
@@ -36,10 +45,12 @@ class FallDetector:
         self.min_box_frac = min_box_frac
         self.cooldown = cooldown_seconds
         self.upright_within_s = upright_within_s
+        self.max_travel_rate = max_travel_rate
         self._streak: dict = {}       # track_id -> consecutive down frames
         self._fired: dict = {}        # track_id -> last-fired timestamp
         self._last_upright: dict = {} # track_id -> timestamp last seen clearly upright
         self._down_since: dict = {}   # track_id -> timestamp of the first down frame
+        self._down_at: dict = {}      # track_id -> (cx, cy, path_px) last centre + travel so far
 
     def update(self, person_boxes, frame_area: float, timestamp: float = 0.0) -> dict | None:
         """`person_boxes`: list of (track_id, x1, y1, x2, y2). Returns a fall dict or None."""
@@ -53,8 +64,21 @@ class FallDetector:
                 continue
             aspect = w / h
             if aspect >= self.down_aspect:
+                cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
                 if self._streak.get(tid, 0) == 0:
                     self._down_since[tid] = timestamp
+                    self._down_at[tid] = (cx, cy, 0.0)
+                elif self.max_travel_rate > 0:
+                    ox, oy, path = self._down_at.get(tid, (cx, cy, 0.0))
+                    path += ((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5
+                    self._down_at[tid] = (cx, cy, path)
+                    elapsed = timestamp - self._down_since.get(tid, timestamp)
+                    if elapsed >= 0.1 and path / elapsed > self.max_travel_rate * max(w, h):
+                        # still moving: walking under the camera, not down
+                        self._streak[tid] = 0
+                        self._down_since.pop(tid, None)
+                        self._down_at.pop(tid, None)
+                        continue
                 self._streak[tid] = self._streak.get(tid, 0) + 1
                 last = self._fired.get(tid, -1e9)
                 fell = (self.upright_within_s <= 0 or
@@ -69,13 +93,14 @@ class FallDetector:
                 self._streak[tid] = 0        # clearly upright → reset latch
                 self._last_upright[tid] = timestamp
                 self._down_since.pop(tid, None)
+                self._down_at.pop(tid, None)
         # forget tracks that vanished — INCLUDING their fired latches: ids never
         # return, so a latch for a departed track is a pure leak. (Audit #4.)
         for tid in [t for t in self._streak if t not in seen]:
             self._streak.pop(tid, None)
         for tid in [t for t in self._fired if t not in seen]:
             self._fired.pop(tid, None)
-        for store in (self._last_upright, self._down_since):
+        for store in (self._last_upright, self._down_since, self._down_at):
             for tid in [t for t in store if t not in seen]:
                 store.pop(tid, None)
         return result
