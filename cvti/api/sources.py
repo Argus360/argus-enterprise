@@ -253,8 +253,13 @@ def _to_api_event(row: dict) -> dict:
             "clip": bool(row.get("evidence_dir")),
         },
         "triage": {
-            "state": "new" if not row.get("review") else row.get("review"),
+            # A provisional the VLM later rejected is settled, not awaiting an
+            # operator: report it resolved so a live alert.update drops it from
+            # the review queue instead of leaving it there as "new".
+            "state": ("resolved" if row.get("retracted")
+                      else "new" if not row.get("review") else row.get("review")),
         },
+        "retracted": bool(row.get("retracted")),
     }
 
 
@@ -262,6 +267,23 @@ def _connect(db_path: str) -> sqlite3.Connection:
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     con.row_factory = sqlite3.Row
     return con
+
+
+def _live_clause(con: sqlite3.Connection) -> str:
+    """SQL predicate for incidents an operator should see.
+
+    A critical alert is shown provisionally before the VLM verdict; when the
+    verdict is "not a threat" the row is kept (audit: "why did it flash?") but
+    marked retracted. Retracted rows are not incidents — listing them, or
+    counting them as awaiting review (their `review` stays NULL on purpose, so
+    TrueSight's rejection never becomes an operator label), filled the CHI
+    queue with forklift work the VLM had already cleared. Older databases
+    without the column have nothing to hide."""
+    try:
+        con.execute("SELECT retracted FROM events LIMIT 0")
+    except sqlite3.OperationalError:
+        return "1=1"
+    return "COALESCE(retracted, 0) = 0"
 
 
 def read_events(db_path: str, *, limit: int = 50, cursor: int | None = None,
@@ -276,14 +298,15 @@ def read_events(db_path: str, *, limit: int = 50, cursor: int | None = None,
         where.append("camera_id = ?"); params.append(camera)
     if priority:
         where.append("priority = ?"); params.append(priority)
-    clause = (" WHERE " + " AND ".join(where)) if where else ""
-    sql = f"SELECT * FROM events{clause} ORDER BY id DESC LIMIT ?"
     params.append(max(1, min(limit, 200)))
     try:
         con = _connect(db_path)
     except sqlite3.OperationalError:
         return {"events": [], "next_cursor": None, "error": "events database unavailable"}
     try:
+        where.append(_live_clause(con))
+        clause = " WHERE " + " AND ".join(where)
+        sql = f"SELECT * FROM events{clause} ORDER BY id DESC LIMIT ?"
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
     except sqlite3.OperationalError as exc:
         con.close()
@@ -340,11 +363,12 @@ def read_triage(db_path: str) -> dict:
     except sqlite3.OperationalError:
         return {"to_review": 0, "total": 0, "by_priority": {}}
     try:
-        total = con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        live = _live_clause(con)
+        total = con.execute(f"SELECT COUNT(*) FROM events WHERE {live}").fetchone()[0]
         to_review = con.execute(
-            "SELECT COUNT(*) FROM events WHERE review IS NULL").fetchone()[0]
+            f"SELECT COUNT(*) FROM events WHERE review IS NULL AND {live}").fetchone()[0]
         rows = con.execute(
-            "SELECT priority, COUNT(*) FROM events GROUP BY priority").fetchall()
+            f"SELECT priority, COUNT(*) FROM events WHERE {live} GROUP BY priority").fetchall()
         by_priority = {r[0]: r[1] for r in rows}
     except sqlite3.OperationalError:
         con.close()
