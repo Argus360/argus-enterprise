@@ -323,6 +323,217 @@ class FFmpegKeyframeCapture:
                 pass
 
 
+_NVDEC_BINARY: "str | None | bool" = False     # False = not probed yet
+_NVDEC_FAILED_SOURCES: set = set()
+import threading as _threading
+# Every camera's decoder opens at once on start-up; without the lock the first
+# caller's in-progress marker (None) read as "no GPU" to the rest, so only one
+# camera got NVDEC and the others silently stayed on the CPU (22 Oct 2026).
+_NVDEC_LOCK = _threading.Lock()
+NVDEC_CODECS = {"h264": "h264_cuvid", "hevc": "hevc_cuvid"}
+
+
+def nvdec_ffmpeg() -> "str | None":
+    """An ffmpeg that can decode on an NVIDIA GPU (NVDEC/CUVID), or None.
+
+    OpenCV's hardware-decode request means VAAPI/D3D11/VideoToolbox; pip
+    OpenCV has no CUDA, so on a cloud NVIDIA box (CHI's T4) every camera was
+    decoded on the CPU while NVDEC sat at 0% — four 4MP HEVC streams held at
+    ~7.7 fps each, and falling behind real time stalled RTSP and dropped
+    streams (22 Oct 2026). The system ffmpeg usually ships the *_cuvid
+    decoders; the imageio static build does not, so it is not considered.
+    Disable with ARGUS_NVDEC=0. Probed once per process."""
+    with _NVDEC_LOCK:
+        return _nvdec_ffmpeg_locked()
+
+
+def _nvdec_ffmpeg_locked() -> "str | None":
+    global _NVDEC_BINARY
+    if _NVDEC_BINARY is not False:
+        return _NVDEC_BINARY or None
+    _NVDEC_BINARY = None
+    if os.environ.get("ARGUS_NVDEC", "1").strip() in ("0", "false", "no", "off"):
+        return None
+    import shutil
+    import subprocess
+    if not shutil.which("nvidia-smi"):
+        return None
+    # The decode library ships separately from the compute driver: Azure's
+    # headless "-server" driver has CUDA but no libnvcuvid, so ffmpeg's cuvid
+    # decoders fail to open ("Cannot load libnvcuvid.so.1"). Check it loads,
+    # or every camera would wait out an ffmpeg timeout before falling back.
+    import ctypes
+    try:
+        ctypes.CDLL("libnvcuvid.so.1")
+    except OSError:
+        log.info("[nvdec] NVIDIA GPU present but libnvcuvid is not installed (install "
+                 "libnvidia-decode-<driver>-server); decoding on the CPU")
+        return None
+    binary = shutil.which("ffmpeg")
+    if not binary:
+        return None
+    try:
+        out = subprocess.run([binary, "-hide_banner", "-decoders"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if all(dec in out for dec in NVDEC_CODECS.values()):
+        _NVDEC_BINARY = binary
+        log.info("[nvdec] GPU video decode available via %s", binary)
+    return _NVDEC_BINARY or None
+
+
+def _nvdec_max_width() -> int:
+    """Width NVDEC scales frames to on the GPU (0 = native). Detection runs at
+    imgsz ~960 and the VLM's vision encoder at ~900, so 1600 keeps every pixel
+    either uses while cutting what crosses into Python by ~2.6x versus 4MP."""
+    try:
+        return max(0, int(os.environ.get("ARGUS_NVDEC_MAX_WIDTH", "1600")))
+    except ValueError:
+        return 1600
+
+
+def _probe_stream(source: str, binary: str, timeout_s: float = 12.0) -> "dict | None":
+    """codec / width / height / fps of the first video stream, via ffprobe."""
+    import json
+    import shutil
+    import subprocess
+    probe = shutil.which("ffprobe") or os.path.join(os.path.dirname(binary), "ffprobe")
+    cmd = [probe, "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate",
+           "-of", "json"]
+    if source.lower().startswith("rtsp"):
+        cmd += ["-rtsp_transport", "tcp"]
+    try:
+        out = subprocess.run(cmd + [source], capture_output=True, text=True,
+                             timeout=timeout_s).stdout
+        stream = (json.loads(out or "{}").get("streams") or [{}])[0]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+    def rate(text: str) -> float:
+        try:
+            num, _, den = str(text).partition("/")
+            return float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            return 0.0
+    if not stream.get("width") or not stream.get("height"):
+        return None
+    return {"codec": str(stream.get("codec_name") or "").lower(),
+            "width": int(stream["width"]), "height": int(stream["height"]),
+            "fps": rate(stream.get("avg_frame_rate")) or rate(stream.get("r_frame_rate"))}
+
+
+class FFmpegNvdecCapture(FFmpegKeyframeCapture):
+    """Full-rate decode on the GPU's NVDEC, frames delivered like the keyframe
+    capture (ffmpeg subprocess -> raw BGR over a loopback socket).
+
+    Every frame is decoded (on the GPU, near-free) and optionally scaled down
+    on the GPU too, then handed over as it arrives. `push_source` tells the
+    decoder loop not to sleep between reads: ffmpeg pushes at the stream's own
+    rate, and pausing the reader backs the socket up until ffmpeg stalls on
+    its RTSP input — the same failure the keyframe path avoids. Detection
+    still samples at its own rate downstream."""
+    keyframes_only = False
+    push_source = True
+
+    def __init__(self, source: Any, *, binary: str, max_width: int = 1600,
+                 open_timeout_s: float = 15.0, io_timeout_s: float = 10.0) -> None:
+        import socket
+        import subprocess
+        import threading
+        self.source = str(source)
+        self.width = self.height = 0
+        self.codec = ""
+        self.fps = 0.0
+        self._frame_bytes = 0
+        self._proc = None
+        self._sock = None
+        self._buf = None
+        self._listener = None
+        self._stderr_tail: list = []
+        self._size_ready = threading.Event()
+        info = _probe_stream(self.source, binary)
+        # Reachable-but-refused (codec, CUDA) is worth remembering; an
+        # unreachable camera is not: it is the reconnect loop's job, not ours.
+        self.probe_ok = info is not None
+        if not info or info["codec"] not in NVDEC_CODECS:
+            log.info("[nvdec] %s: %s — leaving it to the CPU decoder", _redact(self.source),
+                     "probe failed" if not info else f"codec {info['codec']} not supported")
+            return
+        src_w, src_h = info["width"], info["height"]
+        out_w, out_h = src_w, src_h
+        if max_width and src_w > max_width:
+            out_w = max_width - (max_width % 2)
+            out_h = max(2, int(round(src_h * out_w / src_w / 2.0)) * 2)
+        self.codec, self.fps = info["codec"], info["fps"]
+        self.width, self.height = out_w, out_h
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(open_timeout_s)
+        except OSError as exc:
+            log.warning("[nvdec] could not open a loopback socket: %s", exc)
+            listener.close()
+            return
+        port = listener.getsockname()[1]
+        cmd = [binary, "-hide_banner", "-nostdin", "-loglevel", "error",
+               "-fflags", "nobuffer", "-flags", "low_delay"]
+        if self.source.lower().startswith("rtsp"):
+            cmd += ["-rtsp_transport", "tcp", "-timeout", str(int(io_timeout_s * 1_000_000))]
+        cmd += ["-c:v", NVDEC_CODECS[self.codec]]
+        if (out_w, out_h) != (src_w, src_h):
+            cmd += ["-resize", f"{out_w}x{out_h}"]          # scaled on the GPU, in the decoder
+        cmd += ["-i", self.source, "-an", "-sn", "-fps_mode", "passthrough",
+                "-f", "rawvideo", "-pix_fmt", "bgr24", f"tcp://127.0.0.1:{port}"]
+        try:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.PIPE, bufsize=0)
+        except OSError as exc:
+            log.warning("[nvdec] could not start ffmpeg: %s", exc)
+            listener.close()
+            return
+        self._listener = listener
+
+        def pump() -> None:                     # keep stderr drained; remember the tail
+            try:
+                for raw in iter(self._proc.stderr.readline, b""):
+                    line = raw.decode("utf-8", "replace").rstrip()
+                    self._stderr_tail = (self._stderr_tail + [line])[-8:]
+            except (OSError, ValueError, AttributeError):
+                pass
+
+        threading.Thread(target=pump, name="ffmpeg-nvdec-stderr", daemon=True).start()
+        try:
+            conn, _peer = listener.accept()
+        except (OSError, socket.timeout) as exc:
+            log.warning("[nvdec] %s: ffmpeg did not connect within %.0fs (%s; %s)",
+                        _redact(self.source), open_timeout_s, exc,
+                        " | ".join(self._stderr_tail[-2:]))
+            self.release()
+            return
+        finally:
+            listener.close()
+            self._listener = None
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+        except OSError:
+            log.debug("[nvdec] SO_RCVBUF not honoured", exc_info=True)
+        conn.settimeout(max(io_timeout_s, 15.0))
+        self._sock = conn
+        self._frame_bytes = out_w * out_h * 3
+        self._buf = bytearray(self._frame_bytes)
+        log.info("[nvdec] %s: %s %dx%d@%.0f decoding on GPU%s", _redact(self.source),
+                 self.codec, src_w, src_h, self.fps,
+                 f", scaled to {out_w}x{out_h}" if (out_w, out_h) != (src_w, src_h) else "")
+
+    def get(self, prop: int) -> float:
+        if prop == _PROP_FPS:
+            return float(self.fps)
+        return super().get(prop)
+
+
 def _redact(url: str) -> str:
     import re
     return re.sub(r"://[^@/]*@", "://***@", url)
@@ -348,6 +559,22 @@ def open_capture(source: Any, *, low_latency: bool = True, keyframes_only: bool 
                         _redact(str(src)))
         else:
             log.warning("[keyframes] no ffmpeg available; decoding %s in full", _redact(str(src)))
+    if (low_latency and not keyframes_only and not isinstance(src, int)
+            and is_live_source(src) and str(src) not in _NVDEC_FAILED_SOURCES):
+        binary = nvdec_ffmpeg()
+        if binary:
+            cap = FFmpegNvdecCapture(src, binary=binary, max_width=_nvdec_max_width())
+            if cap.isOpened():
+                return cap
+            cap.release()
+            # Reachable but refused (unsupported codec, CUDA error): don't
+            # re-probe on every reconnect; the CPU path keeps the camera working.
+            # An unreachable camera is not remembered, so GPU decode resumes
+            # once it is back.
+            if getattr(cap, "probe_ok", False):
+                _NVDEC_FAILED_SOURCES.add(str(src))
+            log.warning("[nvdec] %s: GPU decode unavailable; using the CPU decoder",
+                        _redact(str(src)))
     hw = [] if _HW_DECODE_FAILED else _hw_decode_params(cv2)
     live_params = _live_decode_params(cv2) if low_latency else []
 

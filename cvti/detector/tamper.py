@@ -31,9 +31,19 @@ class TamperDetector:
         self._streak = 0
         self._firing = False
 
-    @staticmethod
-    def _measure(frame_bgr) -> tuple[float, float]:
+    MEASURE_WIDTH = 320
+
+    @classmethod
+    def _measure(cls, frame_bgr) -> tuple[float, float]:
         import cv2
+        # Brightness and sharpness are compared to this detector's own baseline,
+        # measured the same way, so a 320px thumbnail answers as well as a 4MP
+        # frame at a fraction of the cost (a Laplacian over 1600x938 every frame
+        # was 12% of the CHI engine's main thread).
+        h, w = frame_bgr.shape[:2]
+        if w > cls.MEASURE_WIDTH:
+            frame_bgr = cv2.resize(frame_bgr, (cls.MEASURE_WIDTH, max(1, h * cls.MEASURE_WIDTH // w)),
+                                   interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         brightness = float(gray.mean())
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())

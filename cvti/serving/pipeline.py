@@ -516,7 +516,9 @@ class MultiStreamPipeline:
         self.imgsz = imgsz
         self.conf = conf
         self.device = device or _auto_device()
-        self.half = half and self.device == "cuda"
+        # "cuda:0" is the device the service passes; an exact == "cuda" match
+        # silently dropped --half, so FP16 never switched on (CHI T4, 23 Oct).
+        self.half = half and str(self.device).startswith("cuda")
         self.max_batch = max_batch
         self._camera_states = camera_states
         self._object_watch_runtime = object_watch_runtime
@@ -830,6 +832,54 @@ class MultiStreamPipeline:
             return True
         return False
 
+    # Never spin faster than this (100 loops/s) — a floor on the loop period so
+    # a high adaptive target can't turn the run loop into a busy-wait.
+    _MIN_LOOP_PERIOD_S = 0.01
+
+    # Decoders keep a little more than the detection rate so the detection gate
+    # (0.95 of the period) always finds a fresh frame, never one tick stale.
+    _DECODE_HEADROOM = 1.25
+
+    def _sync_decoder_rates(self) -> None:
+        """Decode each camera at ITS adaptive detection rate.
+
+        Decoders start at the fixed target_fps (detection rate, not publish rate:
+        an unwatched camera must not be decoded flat out). Once the controller
+        sizes a camera, its decoder follows that rate — otherwise the service's
+        --target-fps 8 capped every camera at ~8-10 fps and the controller's
+        floor could never be met (CHI, 22 Oct 2026). The decoder's own
+        measured-sustainable cap and the viewer boost still apply."""
+        for cam_id, rate in self._cam_target_fps.items():
+            decoder = self._decoders.get(cam_id)
+            if decoder is not None and rate > 0:
+                want = rate * self._DECODE_HEADROOM
+                # Never ask a decoder for more than the camera sends: a 30fps
+                # stream asked for 150 reads as "this machine can't keep up"
+                # and logs a false decode-limit warning on every window.
+                source_fps = float(getattr(decoder, "_fps", 0.0) or 0.0)
+                if source_fps > 1.0:
+                    want = min(want, source_fps)
+                decoder.target_fps = max(float(self.target_fps), want)
+
+    def _loop_period(self) -> float:
+        """How long the run loop sleeps between batches.
+
+        Fixed at tick_seconds normally. With the adaptive controller on, the loop
+        keeps up with the SUM of per-camera targets, not the max: a tick mostly
+        carries one camera's newest frame (cameras at ~20fps produce a frame every
+        ~50ms, staggered), so to serve N cameras each at its target the loop must
+        tick at the combined rate. Sizing to the max under-ticked by a factor of N
+        — four cameras each wanting 20fps got ~5fps apiece while the GPU sat idle
+        (CHI, 22 Oct 2026). The controller still holds GPU use near target_busy,
+        so ticking at the sum cannot run the card away, and MIN_LOOP_PERIOD caps
+        the spin."""
+        if self._adaptive is None or not self._cam_target_fps:
+            return self.tick_seconds
+        want = sum(v for v in self._cam_target_fps.values() if v > 0)
+        if want <= 0:
+            return self.tick_seconds
+        return max(self._MIN_LOOP_PERIOD_S, min(self.tick_seconds, 1.0 / want))
+
     def _tick_adaptive(self, now: float) -> None:
         """Re-size the per-camera detection rates once per window.
 
@@ -857,6 +907,7 @@ class MultiStreamPipeline:
             if cameras:
                 self._cam_target_fps = self._adaptive.update(
                     busy_fraction=busy, cameras=cameras)
+                self._sync_decoder_rates()
         except Exception:  # noqa: BLE001 - never let budgeting break detection
             log.debug("adaptive fps tick failed", exc_info=True)
         finally:
@@ -1127,7 +1178,7 @@ class MultiStreamPipeline:
             if self._all_ended():
                 log.info("[serving] all streams ended")
                 break
-            slept = self.tick_seconds - (time.perf_counter() - tick)
+            slept = self._loop_period() - (time.perf_counter() - tick)
             if slept > 0:
                 time.sleep(slept)
         self._report(final=True)
@@ -1493,6 +1544,9 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
     if not store_evidence:
         log.info("[site] store_evidence=false: alerts are recorded without images or clips")
     sink = AlertSink(output_dir, notifier=build_notifier(notify), save_evidence=store_evidence)
+    for state in states.values():
+        # No evidence on disk means no replay clip to build: skip encoding one.
+        state.clip_replay = store_evidence
     queue.on_generated = sink.audit_candidate_generated
     queue.on_admission = sink.audit_candidate_admission
     # W1.6: when detection rides a substream, the sink can still attach one
@@ -1597,18 +1651,35 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
         output_dir, cameras=[str(c.get("id")) for c in site.get("cameras") or []])
         if publish_frames else None)
 
+    _offline_alerted: set[str] = set()   # cameras we've raised an OFFLINE alert for
+
     def _on_link_change(cam_id: str, previous: str, state: str, held: float) -> None:
         """A camera going offline raises its own alert through normal routing.
 
         Without this the customer believes they have coverage they do not have:
         an unreachable camera produces no alerts, which is indistinguishable
         from a camera watching a quiet area.
+
+        Only a REAL outage is worth an alert. A camera reaches OFFLINE only after
+        offline_grace (60s) of failed reconnects, so that fires once per genuine
+        outage. "Recovered" then fires once to clear it. A brief WAN blip that
+        reconnects before OFFLINE is not an outage and must stay silent — firing
+        "recovered" on every >1s blink is what buried the feed in hundreds of
+        auto-confirmed, unverified INFO alerts (CHI, 22 Oct 2026).
         """
         from cvti.serving.streams import CONNECTED, OFFLINE
-        if state not in (OFFLINE, CONNECTED) or (state == CONNECTED and previous == "reconnecting"
-                                                 and held < 1.0):
+        if state == OFFLINE:
+            if cam_id in _offline_alerted:
+                return                      # already alerted this outage
+            _offline_alerted.add(cam_id)
+            offline = True
+        elif state == CONNECTED:
+            if cam_id not in _offline_alerted:
+                return                      # a blip that never reached OFFLINE — silent
+            _offline_alerted.discard(cam_id)
+            offline = False
+        else:
             return
-        offline = state == OFFLINE
         queue.add(QueuedAlert(
             camera_id=cam_id,
             rule_name="camera_offline" if offline else "camera_recovered",

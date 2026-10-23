@@ -8,17 +8,22 @@ def alert(camera="one", detector="concealment"):
         "candidate": SimpleNamespace(detector=detector)})
 
 
-def test_notice_expires_and_does_not_cross_cameras():
+def test_unverified_candidate_shows_nothing():
+    notices = ConcealmentNotices()
+    notices.candidate(alert())
+    assert notices.snapshot("one") is None
+
+
+def test_confirmed_notice_expires_and_does_not_cross_cameras():
     now = [100]
     notices = ConcealmentNotices(lambda: now[0])
     a = alert()
     notices.candidate(a)
-    assert notices.snapshot("one")["phase"] == "verifying"
+    notices.verdict(a, SimpleNamespace(confirmed=True, errored=False))
+    assert notices.snapshot("one")["phase"] == "review"
     assert notices.snapshot("two") is None
     now[0] += 8
     assert notices.snapshot("one") is None
-    notices.verdict(a, SimpleNamespace(confirmed=True, errored=False))
-    assert notices.snapshot("one")["phase"] == "review"
 
 
 def test_rejected_or_error_is_not_a_verified_warning():
@@ -30,14 +35,14 @@ def test_rejected_or_error_is_not_a_verified_warning():
         assert notices.snapshot("one") is None
 
 
-def test_old_rejection_cannot_clear_new_candidate_or_review():
+def test_old_rejection_cannot_clear_a_newer_review():
     notices = ConcealmentNotices()
     a, b = alert(), alert()
     notices.candidate(a)
     notices.candidate(b)
+    notices.verdict(b, SimpleNamespace(confirmed=True))
     notices.verdict(a, SimpleNamespace(confirmed=False))
     assert notices.snapshot("one")["id"] == b.payload["concealment_notice_id"]
-    notices.verdict(b, SimpleNamespace(confirmed=True))
     notices.candidate(alert())
     assert notices.snapshot("one")["phase"] == "review"
 
