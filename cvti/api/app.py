@@ -308,7 +308,7 @@ def create_app(*, db_path: str = "runs/site/events.db",
 
     # ---- live video (transport descriptor) ----------------------------------
     @app.get(f"{API_PREFIX}/camera-by-id/stream")
-    @app.get(f"{API_PREFIX}/cameras/{{camera_id}}/stream")
+    @app.get(f"{API_PREFIX}/cameras/{{camera_id:path}}/stream")
     async def stream(camera_id: str, tracking: bool = False,
                      proxy: bool = False,
                      principal=Depends(require_principal)):
@@ -392,7 +392,7 @@ def create_app(*, db_path: str = "runs/site/events.db",
             return {"kind": "mjpeg", "url": mjpeg}
         return await preview()
 
-    @app.get(f"{API_PREFIX}/cameras/{{camera_id}}/mjpeg")
+    @app.get(f"{API_PREFIX}/cameras/{{camera_id:path}}/mjpeg")
     async def camera_mjpeg(camera_id: str, token: str = Query(...),
                            tracking: bool = False):
         # Same-origin MJPEG proxy for remote browsers. No bearer dependency on

@@ -39,7 +39,10 @@ class ImplementedRoutesAppearInTheContract(unittest.TestCase):
             # the doc writes {id}-style params; the app writes {camera_id}
             pattern = re.sub(r"\{[^}]+\}", r"\\{[^}]+\\}", re.escape(tail)
                              ).replace(r"\\\{[^}]+\\\}", r"\{[^}]+\}")
-            normalized = re.sub(r"\{\{?[a-z_]+\}?\}", "{X}", tail)
+            # Starlette route converters are part of the implementation, not
+            # the public URL contract: {camera_id:path} stays {camera_id} in
+            # the documented OpenAPI path.
+            normalized = re.sub(r"\{\{?[a-z_:]+\}?\}", "{X}", tail)
             doc_normalized = re.sub(r"\{[a-z_]+\}", "{X}", DOC)
             if normalized not in doc_normalized:
                 missing.append(path)
