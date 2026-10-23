@@ -394,7 +394,9 @@ def create_app(*, db_path: str = "runs/site/events.db",
 
     @app.get(f"{API_PREFIX}/cameras/{{camera_id}}/mjpeg")
     async def camera_mjpeg(camera_id: str, token: str = Query(...),
-                           tracking: bool = False):
+                           tracking: bool = False,
+                           fps: Optional[float] = None, width: Optional[int] = None,
+                           quality: Optional[int] = None):
         # Same-origin MJPEG proxy for remote browsers. No bearer dependency on
         # purpose: an <img src> tag cannot send an Authorization header, so this
         # is a capability URL guarded by the per-run publisher token from
@@ -429,10 +431,26 @@ def create_app(*, db_path: str = "runs/site/events.db",
             await client.aclose()
             return _error(502, "stream_unavailable", "Live stream upstream error")
 
+        # A remote browser is behind a tunnel, not on the LAN: four tiles of
+        # the publisher's 20 fps / 640 px stream are ~3 MB/s, and the Tailscale
+        # Funnel path carries ~0.5 MB/s, so every tile starved to 2-6 fps and
+        # looked frozen (CHI, 23 Oct 2026). Shape the stream here: drop to
+        # `fps`, re-encode to `width` px at `quality`. Defaults come from the
+        # environment so a box can be tuned without a rebuild; fps=0 or
+        # width=0 in the query means "as published" (a LAN viewer).
+        from cvti.api.mjpeg_shaper import MjpegShaper, remote_profile
+        profile = remote_profile(fps=fps, width=width, quality=quality)
+        shaper = MjpegShaper(**profile) if profile else None
+
         async def body():
             try:
                 async for chunk in resp.aiter_raw():
-                    yield chunk
+                    if shaper is None:
+                        yield chunk
+                        continue
+                    out = await asyncio.to_thread(shaper.feed, chunk)
+                    if out:
+                        yield out
             finally:
                 await resp.aclose()
                 await client.aclose()

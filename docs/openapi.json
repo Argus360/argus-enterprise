@@ -837,6 +837,33 @@
               "default": false,
               "title": "Tracking"
             }
+          },
+          {
+            "name": "fps",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            },
+            "description": "Max frames per second sent to this viewer. Default from ARGUS_REMOTE_STREAM_FPS or 8. 0 = as published."
+          },
+          {
+            "name": "width",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Re-encode each frame to this width in pixels. Default from ARGUS_REMOTE_STREAM_WIDTH or 480. 0 = as published."
+          },
+          {
+            "name": "quality",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "JPEG quality 10-95 for re-encoded frames. Default from ARGUS_REMOTE_STREAM_QUALITY or 55."
           }
         ],
         "responses": {

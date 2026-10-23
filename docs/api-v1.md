@@ -112,6 +112,12 @@ UI over a tunnel. Returns `{kind: "mjpeg", url}` where `url` is the same-origin
 path below instead of a 127.0.0.1 URL (which would mean the viewer's own
 machine); WebRTC is skipped since it has no off-box path.
 
+The proxy shapes the stream for a remote viewer: at most `fps` frames a
+second, each re-encoded to `width` px at JPEG `quality` (query parameters;
+defaults from `ARGUS_REMOTE_STREAM_FPS` / `_WIDTH` / `_QUALITY`, else 8 / 480 /
+55). `fps=0&width=0` passes the published stream through unchanged — four
+unshaped tiles are ~3 MB/s, more than a tunnel carries.
+
 `GET /cameras/{id}/mjpeg?token=…` (view_live via the per-run publisher token in
 the query, so an `<img>` tag can load it): same-origin MJPEG proxy. Streams the
 loopback frame publisher back to the browser; the publisher itself stays bound
