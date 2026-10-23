@@ -206,9 +206,77 @@ class RealApiTests(unittest.TestCase):
         # /cameras/presets must resolve to its own route, not fall into
         # /cameras/{camera_id} as camera_id='presets' (the 12 Sep field UI
         # error "no such camera 'presets'"). Empty dict matches the mock.
+        site = Path(self.app.state.site_path)
+        site.write_text(json.dumps({"cameras": [{
+            "id": "presets", "source": "rtsp://example/presets",
+        }]}))
         r = self.client.get(f"{PREFIX}/cameras/presets", headers=self._auth())
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json(), {})
+
+    def test_slash_camera_name_reaches_proxy_stream_and_mjpeg(self):
+        """An encoded slash becomes a path separator before Starlette matches."""
+        from unittest.mock import patch
+
+        camera_id = "SMB Bay 3/4"
+        site = Path(self.app.state.site_path)
+        site.write_text(json.dumps({"cameras": [{
+            "id": camera_id, "source": "rtsp://example/smb-bay",
+        }]}))
+        Path(self._tmp.name, "frames.json").write_text(json.dumps({
+            "port": 8765, "token": "publisher-secret",
+        }))
+
+        class LoopbackResponse:
+            status_code = 200
+            headers = {"content-type": "multipart/x-mixed-replace; boundary=frame"}
+
+            async def aiter_raw(self):
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\nframe\r\n"
+
+            async def aclose(self):
+                pass
+
+        class LoopbackClient:
+            requests = []
+
+            def __init__(self, **_kwargs):
+                pass
+
+            def build_request(self, method, url):
+                self.requests.append((method, url))
+                return (method, url)
+
+            async def send(self, request, stream=False):
+                self.requests.append((request, stream))
+                return LoopbackResponse()
+
+            async def aclose(self):
+                pass
+
+        headers = self._auth()
+        encoded = "SMB%20Bay%203%2F4"
+        with patch("httpx.AsyncClient", LoopbackClient):
+            detail = self.client.get(f"{PREFIX}/camera-by-id", params={
+                "camera_id": camera_id,
+            }, headers=headers)
+            self.assertEqual(detail.status_code, 200, detail.text)
+            self.assertEqual(detail.json()["id"], camera_id)
+            descriptor = self.client.get(
+                f"{PREFIX}/cameras/{encoded}/stream?proxy=1", headers=headers)
+            self.assertEqual(descriptor.status_code, 200, descriptor.text)
+            self.assertEqual(descriptor.json()["kind"], "mjpeg")
+            self.assertEqual(
+                descriptor.json()["url"],
+                f"{PREFIX}/cameras/{encoded}/mjpeg?token=publisher-secret",
+            )
+            proxied = self.client.get(descriptor.json()["url"])
+
+        self.assertEqual(proxied.status_code, 200, proxied.text)
+        self.assertIn(b"frame", proxied.content)
+        self.assertEqual(LoopbackClient.requests[0][0], "GET")
+        self.assertIn("/stream/SMB%20Bay%203%2F4?token=publisher-secret",
+                      LoopbackClient.requests[0][1])
 
     def test_reads_follow_the_active_feed_not_the_boot_site(self):
         # switch_feed moves the backend to another feed's config + event store;
