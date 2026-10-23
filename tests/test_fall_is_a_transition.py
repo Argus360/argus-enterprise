@@ -34,6 +34,24 @@ class FallNeedsATransition(unittest.TestCase):
         self.assertIsNone(d.update([DOWN], AREA, timestamp=15.0))
         self.assertIsNone(d.update([DOWN], AREA, timestamp=15.5))
 
+    def test_person_walking_under_an_overhead_camera_is_not_a_fall(self):
+        # Foreshortened from above the box goes wide, but it keeps travelling.
+        d = FallDetector(min_frames=3)
+        d.update([UP], AREA, timestamp=10.0)
+        for i in range(6):
+            x = 100 + i * 120                       # moves ~a box width per frame
+            box = (1, x, 100, x + 300, 220)         # w/h 2.5 — "down"
+            self.assertIsNone(d.update([box], AREA, timestamp=10.2 + i * 0.2))
+
+    def test_person_down_and_still_is_a_fall(self):
+        d = FallDetector(min_frames=3)
+        d.update([UP], AREA, timestamp=10.0)
+        got = None
+        for i in range(4):
+            box = (1, 100 + i * 5, 100, 400 + i * 5, 220)   # a wobble, not travel
+            got = d.update([box], AREA, timestamp=10.2 + i * 0.2) or got
+        self.assertEqual(got and got["kind"], "fall")
+
     def test_old_static_behaviour_is_opt_in(self):
         d = FallDetector(min_frames=2, upright_within_s=0)
         d.update([DOWN], AREA, timestamp=10.0)
