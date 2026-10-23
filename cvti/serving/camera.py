@@ -245,6 +245,13 @@ class PerCameraState:
     # of every frame — their consumers are temporal accumulators plus the VLM
     # gate, and half the samples still trigger them; the model cost halves.
     heavy_stride: int = 2
+    # Time budget for the heavy (pose + weapon) pass. The stride above scales
+    # with detection fps, so every fps gain bought MORE pose inferences; with
+    # people always in view a warehouse camera ran pose ~6x/s (CHI, 23 Oct
+    # 2026). Both gates must pass. A person's first appearance still always
+    # runs. 0 disables the time gate.
+    heavy_min_interval_s: float = 0.5
+    _heavy_last_at: float = field(default=-1.0, init=False, repr=False)
     va_fps: float = 5.0
     va_window_seconds: float = 4.0
     va_frames: int = 16
@@ -1052,6 +1059,11 @@ class PerCameraState:
             self._heavy_tick += 1
             run_heavy = person_present and (
                 first_appearance or self._heavy_tick % max(1, self.heavy_stride) == 0)
+            if run_heavy and not first_appearance and self.heavy_min_interval_s > 0 \
+                    and timestamp - self._heavy_last_at < self.heavy_min_interval_s:
+                run_heavy = False
+            if run_heavy:
+                self._heavy_last_at = timestamp
             if self.heavy_runner is not None:
                 raw_events += self.heavy_runner.drain(self.camera_id)
                 raw_events += self._heavy_submit_or_light(
@@ -1506,6 +1518,7 @@ def build_camera_states(site_config: dict, *, pose_model: Any = None, weapon_mod
                 # same imgsz as the shared detector, not a leaked default.
                 imgsz=imgsz,
                 heavy_stride=int(cam.get("heavy_stride", 2)),
+                heavy_min_interval_s=float(cam.get("heavy_min_interval_s", 0.5)),
                 concealment=cam.get("concealment", False),
                 violence=cam.get("violence", False),
                 weapons=cam.get("weapons", False), theft=cam.get("theft", False),

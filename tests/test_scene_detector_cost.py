@@ -66,3 +66,47 @@ class TamperMeasuresOnAThumbnail(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeavyPassHasATimeBudget(unittest.TestCase):
+    """The pose/weapon pass runs on a time budget, not just a frame stride."""
+
+    def _decide(self, state, present, ts):
+        # Mirror the decision in process(): stride gate AND time gate, with a
+        # person's first appearance always running.
+        first = present and not state._person_seen_last_frame
+        state._person_seen_last_frame = present
+        state._heavy_tick += 1
+        run = present and (first or state._heavy_tick % max(1, state.heavy_stride) == 0)
+        if run and not first and state.heavy_min_interval_s > 0 \
+                and ts - state._heavy_last_at < state.heavy_min_interval_s:
+            run = False
+        if run:
+            state._heavy_last_at = ts
+        return run
+
+    def test_decision_logic_matches_process(self):
+        import inspect
+        from cvti.serving.camera import PerCameraState as P
+        src = inspect.getsource(P.process)
+        self.assertIn("timestamp - self._heavy_last_at < self.heavy_min_interval_s", src)
+        self.assertIn("self._heavy_last_at = timestamp", src)
+
+    def test_first_appearance_always_runs(self):
+        s = _state(heavy_stride=2, heavy_min_interval_s=0.5)
+        self.assertTrue(self._decide(s, True, 10.0))
+        s._person_seen_last_frame = False          # person left and came back
+        self.assertTrue(self._decide(s, True, 10.1))
+
+    def test_at_most_twice_a_second_with_people_present(self):
+        s = _state(heavy_stride=1, heavy_min_interval_s=0.5)
+        self._decide(s, True, 0.0)
+        runs = sum(self._decide(s, True, 0.0 + i / 20) for i in range(1, 41))   # 2s at 20 fps
+        self.assertLessEqual(runs, 4)
+        self.assertGreaterEqual(runs, 3)
+
+    def test_zero_interval_restores_stride_only(self):
+        s = _state(heavy_stride=2, heavy_min_interval_s=0.0)
+        self._decide(s, True, 0.0)
+        runs = sum(self._decide(s, True, i / 20) for i in range(1, 41))
+        self.assertEqual(runs, 20)

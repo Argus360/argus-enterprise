@@ -1,4 +1,7 @@
-"""Pose and weapon run only when a frame earns them (latency audit 1 Sep, D3).
+"""
+# These tests pin the frame STRIDE of the heavy pass; the separate time budget
+# (heavy_min_interval_s, tests/test_scene_detector_cost.py) is switched off here.
+Pose and weapon run only when a frame earns them (latency audit 1 Sep, D3).
 
 The two heaviest per-camera models ran unconditionally, every frame — on
 empty corridors, on parked cars, all night. Everything they feed (concealment,
@@ -75,7 +78,7 @@ class _GateHarness(unittest.TestCase):
     def _state(self, **kw) -> PerCameraState:
         eng = CustomizationEngine("configs/all_threats_v1.json",
                                   baseline_path="configs/baseline_critical_v1.json")
-        state = PerCameraState("cam1", eng, person_filter=False,
+        state = PerCameraState("cam1", eng, person_filter=False, heavy_min_interval_s=0.0,
                                pose_model=object(), weapon_model=object(),
                                concealment=True, weapons=True, **kw)
         return state
@@ -141,7 +144,7 @@ class PersonGateTests(_GateHarness):
                      "priority": "high"}
                 ]
                 state = PerCameraState(
-                    "cam1", engine, person_filter=False, pose_model=object(),
+                    "cam1", engine, person_filter=False, heavy_min_interval_s=0.0, pose_model=object(),
                     concealment=True, heavy_stride=stride,
                 )
                 pose_sequence = (
@@ -166,7 +169,7 @@ class PersonGateTests(_GateHarness):
 
     def test_pose_failure_does_not_bypass_concealment_expiration(self):
         state = PerCameraState(
-            "cam1", CustomizationEngine(), person_filter=False,
+            "cam1", CustomizationEngine(), person_filter=False, heavy_min_interval_s=0.0,
             pose_model=object(), concealment=True, heavy_stride=1,
         )
         with mock.patch.object(
@@ -209,7 +212,7 @@ class ImgszPlumbingTests(unittest.TestCase):
         delayed = _DelayedPerf("cvti.serving.perf")
         delayed.BOARD = _Board()
         state = PerCameraState(
-            "pose-import-contract", CustomizationEngine(), person_filter=False,
+            "pose-import-contract", CustomizationEngine(), person_filter=False, heavy_min_interval_s=0.0,
             pose_model=object(), concealment=True,
         )
         with mock.patch.dict(sys.modules, {"cvti.serving.perf": delayed}), \
@@ -223,15 +226,18 @@ class ImgszPlumbingTests(unittest.TestCase):
         from cvti.serving.perf import BOARD
 
         state = PerCameraState(
-            "pose-perf-contract", CustomizationEngine(), person_filter=False,
+            "pose-perf-contract", CustomizationEngine(), person_filter=False, heavy_min_interval_s=0.0,
             pose_model=object(), concealment=True,
         )
+        # BOARD is a process-wide singleton: measure the delta, so running this
+        # file alongside others that touch the board cannot break it.
+        before = BOARD.snapshot().get("pose_infer", {}).get("pose-perf-contract", {})
         with mock.patch("cvti.detector.core.extract_pose_people", return_value=[]):
             state._compute_pose(_frame(), timestamp=100.0)
 
         pose = BOARD.snapshot()["pose_infer"]["pose-perf-contract"]
-        self.assertEqual(pose["count"], 1)
-        self.assertEqual(pose["units"], 1)
+        self.assertEqual(pose["count"] - before.get("count", 0), 1)
+        self.assertEqual(pose["units"] - before.get("units", 0), 1)
 
     def test_build_camera_states_hands_the_engines_imgsz_to_every_camera(self):
         site = {"cameras": [{"id": "front", "source": "x",
