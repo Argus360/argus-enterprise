@@ -1544,6 +1544,9 @@ def run_site(site_config_path: str, *, weights: str = "models/yolov8n.pt",
     if not store_evidence:
         log.info("[site] store_evidence=false: alerts are recorded without images or clips")
     sink = AlertSink(output_dir, notifier=build_notifier(notify), save_evidence=store_evidence)
+    for state in states.values():
+        # No evidence on disk means no replay clip to build: skip encoding one.
+        state.clip_replay = store_evidence
     queue.on_generated = sink.audit_candidate_generated
     queue.on_admission = sink.audit_candidate_admission
     # W1.6: when detection rides a substream, the sink can still attach one

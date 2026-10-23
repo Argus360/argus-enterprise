@@ -176,6 +176,14 @@ class PerCameraState:
     weapons: bool = False
     theft: bool = False
     tamper: bool = False              # camera block/tamper detection (pure CV)
+    # Keep the rolling JPEG replay window for evidence clips. Off when the site
+    # stores no evidence: encoding every frame for a clip that is never written
+    # cost 13% of the main thread on the CHI pilot (23 Oct 2026).
+    clip_replay: bool = True
+    # Whole-frame CV detectors (tamper, fire/smoke) look at the scene, not at
+    # people; the scene does not change 20 times a second. They run at most
+    # this often, which cut another ~20% of the main thread.
+    scene_detector_interval_s: float = 0.5
     fall: bool = False                # person collapsed / on the ground (person boxes)
     # HSE situational detectors (cvti.detector.situational) — cheap candidate
     # generators the VLM gate then confirms.
@@ -263,6 +271,7 @@ class PerCameraState:
     _heavy_tick: int = field(default=0, init=False, repr=False)
     _person_seen_last_frame: bool = field(default=False, init=False, repr=False)
     _tamper_det: Any = field(default=None, init=False, repr=False)
+    _scene_next: dict = field(default_factory=dict, init=False, repr=False)
     _fall_det: Any = field(default=None, init=False, repr=False)
     _fire_det: Any = field(default=None, init=False, repr=False)
     _first_seen_ts: float = field(default=-1.0, init=False, repr=False)
@@ -749,6 +758,21 @@ class PerCameraState:
                       exc_info=True)
             return ()
 
+    def _record_clip_frame(self, image, timestamp: float) -> None:
+        """Append one frame to the evidence replay window, if we keep one."""
+        if not self.clip_replay:
+            return
+        clip_jpeg = encode_clip_frame(image)
+        if clip_jpeg is not None:
+            self._clip_buffer.append((timestamp, clip_jpeg))
+
+    def _scene_due(self, name: str, timestamp: float) -> bool:
+        """Rate-limit a whole-frame scene detector to scene_detector_interval_s."""
+        if timestamp >= self._scene_next.get(name, 0.0):
+            self._scene_next[name] = timestamp + self.scene_detector_interval_s
+            return True
+        return False
+
     def process(self, detections: Any, image: Any, timestamp: float,
                 object_detections: list | None = None, *,
                 object_watch_source_generation: int | None = None,
@@ -773,9 +797,7 @@ class PerCameraState:
         self._frame_buffer.append(image)
         # Continuous replay buffer: a rolling JPEG window with timestamps so a
         # confirmed alert replays as real video of the lead-up.
-        clip_jpeg = encode_clip_frame(image)
-        if clip_jpeg is not None:
-            self._clip_buffer.append((timestamp, clip_jpeg))
+        self._record_clip_frame(image, timestamp)
 
         # Camera tamper/block runs on the raw frame — independent of any person,
         # since a covered camera shows nothing. Cheap CV, every frame.
@@ -809,7 +831,7 @@ class PerCameraState:
             for event, panel in state_events:
                 raw_events.append(event)
                 object_state_evidence[(event.extra["zone"], event.state)] = panel
-        if self.tamper:
+        if self.tamper and self._scene_due("tamper", timestamp):
             if self._tamper_det is None:
                 from cvti.detector.tamper import TamperDetector
                 self._tamper_det = TamperDetector()
@@ -825,7 +847,7 @@ class PerCameraState:
         settled = (timestamp - self._first_seen_ts) >= self.settle_seconds
 
         # Fire + smoke — pure CV pre-filter on the raw frame (no person needed).
-        if self.fire_smoke and settled:
+        if self.fire_smoke and settled and self._scene_due("fire", timestamp):
             if self._fire_det is None:
                 from cvti.detector.situational import FireSmokeCandidateDetector
                 self._fire_det = FireSmokeCandidateDetector(
