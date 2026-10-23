@@ -40,7 +40,9 @@ file sends every detector through the verifier, including violence.
 **Lying down is not a fall.** The fall detector fired on anyone wider than
 tall for four frames — someone on the floor, crouching, or bending over a
 pallet. It now needs the same person to have been upright within 2.5
-seconds of going down.
+seconds of going down — and to have stopped: a box that keeps travelling
+across the floor is someone walking under an overhead camera, which the
+Warehouse camera had confirmed as a collapse.
 
 **Work that isn't per-frame no longer costs per-frame.** Tamper and
 fire/smoke sample at 2 Hz, the tamper measure runs on a 320-pixel
