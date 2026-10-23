@@ -131,3 +131,16 @@ class ConcurrentStartup(unittest.TestCase):
                 t.join()
         capture._NVDEC_BINARY = False
         self.assertEqual(results, ["/usr/bin/ffmpeg"] * 4)
+
+
+class HalfPrecisionOnIndexedCudaDevice(unittest.TestCase):
+    def test_cuda_index_keeps_half(self):
+        from cvti.serving.pipeline import MultiStreamPipeline
+        with mock.patch("cvti.serving.pipeline._auto_device", return_value="cuda:0"):
+            p = MultiStreamPipeline({"a": "rtsp://x"}, device="cuda:0", half=True)
+        self.assertTrue(p.half)
+
+    def test_cpu_never_half(self):
+        from cvti.serving.pipeline import MultiStreamPipeline
+        p = MultiStreamPipeline({"a": "rtsp://x"}, device="cpu", half=True)
+        self.assertFalse(p.half)

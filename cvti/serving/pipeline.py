@@ -516,7 +516,9 @@ class MultiStreamPipeline:
         self.imgsz = imgsz
         self.conf = conf
         self.device = device or _auto_device()
-        self.half = half and self.device == "cuda"
+        # "cuda:0" is the device the service passes; an exact == "cuda" match
+        # silently dropped --half, so FP16 never switched on (CHI T4, 23 Oct).
+        self.half = half and str(self.device).startswith("cuda")
         self.max_batch = max_batch
         self._camera_states = camera_states
         self._object_watch_runtime = object_watch_runtime
