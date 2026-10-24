@@ -82,6 +82,43 @@ def monitor_state(db_path: str) -> dict:
     return state
 
 
+def read_link_events(db_path: str, *, now: float | None = None) -> list[dict]:
+    """Recent per-camera link transitions for operations health surfaces.
+
+    Link transitions are operational state, not incidents. Keep a compact
+    24-hour summary here so operators can see outages and recoveries without
+    polluting the incident queue.
+    """
+    if not Path(db_path).exists():
+        return []
+    cutoff = (time.time() if now is None else now) - 24 * 60 * 60
+    try:
+        con = _connect(db_path)
+        rows = con.execute(
+            "SELECT camera_id, rule, ts, reason FROM events "
+            "WHERE rule IN ('camera_offline', 'camera_recovered') AND ts >= ? "
+            "ORDER BY ts DESC, id DESC", (cutoff,)
+        ).fetchall()
+        con.close()
+    except sqlite3.OperationalError:
+        return []
+
+    summary: dict[str, dict] = {}
+    for row in rows:
+        camera_id = str(row["camera_id"] or "")
+        item = summary.setdefault(camera_id, {
+            "camera_id": camera_id,
+            "offline_count": 0,
+            "recovered_count": 0,
+            "last_event_ts": row["ts"],
+            "last_event_rule": row["rule"],
+            "last_reason": row["reason"] or "",
+        })
+        key = "offline_count" if row["rule"] == "camera_offline" else "recovered_count"
+        item[key] += 1
+    return list(summary.values())
+
+
 # ---- cameras ----------------------------------------------------------------
 
 def _zone_count(zones_path) -> int:
@@ -278,12 +315,16 @@ def _live_clause(con: sqlite3.Connection) -> str:
     counting them as awaiting review (their `review` stays NULL on purpose, so
     TrueSight's rejection never becomes an operator label), filled the CHI
     queue with forklift work the VLM had already cleared. Older databases
-    without the column have nothing to hide."""
+    without the column have nothing to hide. Camera link transitions have
+    their own health surface and are never incidents."""
+    incident_rule = (
+        "COALESCE(rule, '') NOT IN ('camera_offline', 'camera_recovered')"
+    )
     try:
         con.execute("SELECT retracted FROM events LIMIT 0")
     except sqlite3.OperationalError:
-        return "1=1"
-    return "COALESCE(retracted, 0) = 0"
+        return incident_rule
+    return f"COALESCE(retracted, 0) = 0 AND {incident_rule}"
 
 
 def read_events(db_path: str, *, limit: int = 50, cursor: int | None = None,

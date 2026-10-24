@@ -707,6 +707,33 @@ label.person-boxes-control {
   border-left: 1px solid var(--line);
   padding-left: 24px;
 }
+.camera-link-strip {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 14px;
+  margin-bottom: 18px;
+}
+.camera-link-strip .section-bar h2 {
+  font-size: 11px;
+}
+.camera-link-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 0;
+  font-size: 10px;
+}
+.camera-link-row > svg {
+  color: var(--muted);
+}
+.camera-link-row > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.camera-link-row > small {
+  grid-column: 2 / -1;
+  color: var(--muted);
+}
 .badge {
   display: inline-flex;
   align-items: center;

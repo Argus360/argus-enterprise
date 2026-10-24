@@ -30,6 +30,7 @@ export function applyPushEvent(
     monitor: {
       ...workspace.monitor,
       ...engine,
+      link_events: health.link_events ?? workspace.monitor.link_events ?? [],
       status: health.status,
       generated_at: health.generated_at,
       running: typeof engine.running === "boolean"

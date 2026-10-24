@@ -194,6 +194,40 @@ class RealApiTests(unittest.TestCase):
         self.assertIn("rtsp://***@10.0.0.9/stream1", cams[0]["source"])
         self.assertEqual(cams[0]["state"], "connected")   # merged from health
 
+    def test_camera_link_rows_are_health_not_incidents(self):
+        now = time.time()
+        con = sqlite3.connect(Path(self._tmp.name) / "events.db")
+        con.executemany(
+            "INSERT INTO events (ts, iso, camera_id, rule, priority, reason) "
+            "VALUES (?, '', ?, ?, 'high', ?)",
+            [
+                (now - 1800, "CHI Production", "camera_offline", "link lost"),
+                (now - 900, "CHI Production", "camera_recovered", "stream returned"),
+                (now - 48 * 3600, "CHI Production", "camera_offline", "old outage"),
+                (now - 60, "CHI Production", "person_intrusion", "person in restricted area"),
+            ],
+        )
+        con.commit()
+        con.close()
+
+        headers = self._auth()
+        events = self.client.get(f"{PREFIX}/events", headers=headers).json()["events"]
+        self.assertEqual([event["rule"] for event in events], [
+            "person_intrusion", "video_theft", "custom:hoodie",
+        ])
+        triage = self.client.get(f"{PREFIX}/triage", headers=headers).json()
+        self.assertEqual(triage["total"], 3)
+
+        health = self.client.get(f"{PREFIX}/system/health", headers=headers).json()
+        link = next(row for row in health["link_events"]
+                    if row["camera_id"] == "CHI Production")
+        self.assertEqual(link["offline_count"], 1)
+        self.assertEqual(link["recovered_count"], 1)
+        self.assertEqual(link["last_event_rule"], "camera_recovered")
+
+        monitor = self.client.get(f"{PREFIX}/monitor", headers=headers).json()
+        self.assertEqual(monitor["link_events"], health["link_events"])
+
     def test_sign_out_returns_empty_204_not_crashing_null(self):
         # DELETE /auth/session is a 204: the body MUST be empty. Returning
         # JSONResponse(None) wrote "null" against Content-Length 0 and crashed

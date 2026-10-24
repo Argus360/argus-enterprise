@@ -1023,6 +1023,26 @@ export default function App() {
                       </div>
                     </section>
                     <aside className="activity">
+                      {mode === "engine" && Array.isArray(ws.monitor.link_events) &&
+                        ws.monitor.link_events.length > 0 && (
+                          <section className="camera-link-strip" aria-label="Camera link events">
+                            <div className="section-bar">
+                              <h2>Camera link · last 24 hours</h2>
+                            </div>
+                            {ws.monitor.link_events.map((link: Json) => (
+                              <div className="camera-link-row" key={String(link.camera_id)}>
+                                <Radio size={14} aria-hidden="true" />
+                                <strong>{String(link.camera_id)}</strong>
+                                <Badge tone={link.last_event_rule === "camera_offline" ? "red" : "green"}>
+                                  {link.last_event_rule === "camera_offline" ? "Offline" : "Recovered"}
+                                </Badge>
+                                <small>
+                                  {Number(link.offline_count || 0)} offline · {Number(link.recovered_count || 0)} recovered
+                                </small>
+                              </div>
+                            ))}
+                          </section>
+                        )}
                       <div className="section-bar">
                         <h2>Needs attention</h2>
                         <Badge tone="amber">{open.length}</Badge>

@@ -216,7 +216,7 @@ def create_app(*, db_path: str = "runs/site/events.db",
 
     @app.get(f"{API_PREFIX}/monitor")
     async def monitor(principal=Depends(require_principal)):
-        return _monitor_state()
+        return {**_monitor_state(), "link_events": sources.read_link_events(_db())}
 
     def _monitor_state():
         state = sources.monitor_state(_db())
@@ -240,6 +240,7 @@ def create_app(*, db_path: str = "runs/site/events.db",
 
     def _health_snapshot():
         doc = sources.read_health(_db())
+        doc["link_events"] = sources.read_link_events(_db())
         state = _monitor_state()
         # Polling and push must agree even before the child's first heartbeat
         # or after it exits. A stale file must not undo the process owner's state.
